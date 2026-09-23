@@ -96,7 +96,7 @@ function routeToFlow(state, userId, replyToken, text) {
   }
 }
  
- // ===== StateManager.gs =====
+// ===== StateManager.gs =====
 // ・会話の途中経過（今どのステップか、これまでの入力内容）はCacheServiceに一時保存します。
 //   30分操作がないと自動的に消え、最初からやり直しになります。
 // ・「動員する人の名前」は毎回聞き直さなくて済むよう、PropertiesServiceに長期保存します。
@@ -124,7 +124,7 @@ const StateManager = {
   },
 };
  
- // ===== LineApi.gs =====
+// ===== LineApi.gs =====
 // LINE Messaging APIへの返信（reply）とプッシュ通知（push）をまとめたヘルパー。
  
 const LineApi = {
@@ -170,14 +170,14 @@ const LineApi = {
   },
 };
  
- // ===== SheetUtils.gs =====
+// ===== SheetUtils.gs =====
 // 親（コントロール）シートと、開催ごとの予約シートファイルへのアクセスをまとめたヘルパー。
- 
+
 const SheetUtils = {
   getControlSheet() {
     return SpreadsheetApp.openById(CONFIG.CONTROL_SHEET_ID);
   },
- 
+
   // 「募集中」の開催を1件取得する（同時に複数募集中にはならない前提）
   getActiveEvent() {
     const sheet = this.getControlSheet().getSheetByName(SHEET_NAMES.EVENT_MASTER);
@@ -186,7 +186,7 @@ const SheetUtils = {
     const idxId = header.indexOf('開催ID');
     const idxUrl = header.indexOf('予約シートURL');
     const idxStatus = header.indexOf('ステータス');
- 
+
     for (let i = 1; i < rows.length; i++) {
       if (rows[i][idxStatus] === '募集中') {
         return { eventId: rows[i][idxId], spreadsheetUrl: rows[i][idxUrl] };
@@ -194,17 +194,17 @@ const SheetUtils = {
     }
     return null;
   },
- 
+
   openReservationSpreadsheet(url) {
     return SpreadsheetApp.openById(this.extractSpreadsheetId(url));
   },
- 
+
   extractSpreadsheetId(url) {
     const m = String(url).match(/\/d\/([a-zA-Z0-9-_]+)/);
     if (!m) throw new Error('スプレッドシートURLからIDを取得できません: ' + url);
     return m[1];
   },
- 
+
   // シートを「1行目=見出し」の連想配列の配列として読み込む共通処理
   _readTable(ss, sheetName) {
     const sheet = ss.getSheetByName(sheetName);
@@ -218,43 +218,65 @@ const SheetUtils = {
         return obj;
       });
   },
- 
+
   getSlotList(ss) {
-    return this._readTable(ss, SHEET_NAMES.SLOT_MASTER);
+    // 開始時刻はタイムゾーン解釈によるズレを避けるため、
+    // 数値としてではなく「スプレッドシートに表示されている文字列」をそのまま読み込む
+    const sheet = ss.getSheetByName(SHEET_NAMES.SLOT_MASTER);
+    const rows = sheet.getDataRange().getDisplayValues();
+    const header = rows[0];
+    return rows.slice(1)
+      .filter(r => r.some(v => v !== ''))
+      .map(r => {
+        const obj = {};
+        header.forEach((h, i) => obj[h] = r[i]);
+        return obj;
+      });
   },
- 
+
   getStaffList(ss) {
     return this._readTable(ss, SHEET_NAMES.STAFF_LIST);
   },
- 
+
   getTreatmentMenu(ss) {
     return this._readTable(ss, SHEET_NAMES.TREATMENT_MENU).map(r => r['施術名']);
   },
- 
+
   getReservations(ss) {
     return this._readTable(ss, SHEET_NAMES.RESERVATIONS);
   },
- 
+
   // 指定した枠番号の現在の受付件数（キャンセルを除く）
   countReservationsInSlot(ss, slotNumber) {
     return this.getReservations(ss)
       .filter(r => Number(r['枠番号']) === Number(slotNumber) && r['ステータス'] !== 'キャンセル')
       .length;
   },
- 
+
   // 新規予約を1行追加。受付可能人数を超えていれば自動的に「要確認」にする
   appendReservation(ss, data) {
     const sheet = ss.getSheetByName(SHEET_NAMES.RESERVATIONS);
+
     const lastRow = sheet.getLastRow();
-    const newId = lastRow < 2 ? 1 : Number(sheet.getRange(lastRow, 1).getValue()) + 1;
- 
+    const idValues = lastRow >= 2
+      ? sheet.getRange(2, 1, lastRow - 1, 1).getValues().flat()
+      : [];
+
+    // 予約IDは「既存の数値の最大値+1」。空欄行があっても影響を受けない
+    const numericIds = idValues.filter(v => typeof v === 'number');
+    const newId = numericIds.length > 0 ? Math.max(...numericIds) + 1 : 1;
+
+    // 予約ID列（A列）が空欄になっている最初の行に書き込む。なければ最終行の次に追加する
+    const blankIndex = idValues.findIndex(v => v === '' || v === null || v === undefined);
+    const targetRow = (blankIndex === -1) ? lastRow + 1 : blankIndex + 2; // +2はA2始まりのオフセット
+
     const slots = this.getSlotList(ss);
     const slot = slots.find(s => Number(s['枠番号']) === Number(data.slotNumber));
     const capacity = slot ? Number(slot['受付可能人数']) : 0;
     const currentCount = this.countReservationsInSlot(ss, data.slotNumber);
     const status = (currentCount + 1) > capacity ? '要確認' : '受付';
- 
-    sheet.appendRow([
+
+    sheet.getRange(targetRow, 1, 1, 14).setValues([[
       newId,
       data.slotNumber,
       data.organizerName,
@@ -269,11 +291,20 @@ const SheetUtils = {
       '', // 確定担当者（前日ミーティングで記入）
       '', // 確定枠番号（同上）
       '', // 主催者メモ
-    ]);
- 
+    ]]);
+
+    // 枠表示（O列）・重複チェック（P列）は数式で自動計算されるようにする
+    // 「$B列が空欄でない」条件を加えて、空欄行同士が誤って重複判定されないようにしている
+    sheet.getRange(targetRow, 15).setFormula(
+      `=IFERROR(VLOOKUP($B${targetRow},枠マスタ!$A:$E,2,FALSE)&"("&TEXT(VLOOKUP($B${targetRow},枠マスタ!$A:$E,3,FALSE),"HH:mm")&")","")`
+    );
+    sheet.getRange(targetRow, 16).setFormula(
+      `=IF(AND($B${targetRow}<>"",COUNTIFS($B$2:$B,$B${targetRow},$G$2:$G,$G${targetRow},$K$2:$K,"<>キャンセル")>1),"⚠重複あり","")`
+    );
+
     return { reservationId: newId, status: status };
   },
- 
+
   // 動員する人の名前＋ゲスト名で予約を検索（キャンセル済みは除く）
   findReservation(ss, organizerName, guestName) {
     const sheet = ss.getSheetByName(SHEET_NAMES.RESERVATIONS);
@@ -281,7 +312,7 @@ const SheetUtils = {
     const header = rows[0];
     const idx = {};
     header.forEach((h, i) => idx[h] = i);
- 
+
     const matches = [];
     for (let r = 1; r < rows.length; r++) {
       const row = rows[r];
@@ -293,11 +324,11 @@ const SheetUtils = {
     }
     return matches;
   },
- 
+
   updateReservationStatus(ss, rowIndex, status) {
     this.updateReservationField(ss, rowIndex, 'ステータス', status);
   },
- 
+
   updateReservationField(ss, rowIndex, fieldName, value) {
     const sheet = ss.getSheetByName(SHEET_NAMES.RESERVATIONS);
     const header = sheet.getRange(1, 1, 1, sheet.getLastColumn()).getValues()[0];
@@ -305,7 +336,7 @@ const SheetUtils = {
     if (col === 0) throw new Error('列が見つかりません: ' + fieldName);
     sheet.getRange(rowIndex, col).setValue(value);
   },
- 
+
   // 主催者通知先（通知ON/OFF=ONの人）全員にLINE通知
   notifyOrganizers(message) {
     const sheet = this.getControlSheet().getSheetByName(SHEET_NAMES.NOTIFY_LIST);
@@ -313,7 +344,7 @@ const SheetUtils = {
     const header = rows[0];
     const idxId = header.indexOf('LINE User ID');
     const idxOnOff = header.indexOf('通知ON/OFF');
- 
+
     for (let i = 1; i < rows.length; i++) {
       if (rows[i][idxOnOff] === 'ON' && rows[i][idxId]) {
         LineApi.push(rows[i][idxId], message);
@@ -321,10 +352,10 @@ const SheetUtils = {
     }
   },
 };
- 
- // ===== RegisterFlow.gs =====
+
+// ===== RegisterFlow.gs =====
 // 「登録」フロー：動員者名(初回のみ)→ゲスト名→時間枠→年齢→性別→希望対応者→施術(複数可)→伝達事項→確認→保存
- 
+
 const RegisterFlow = {
   start(userId, replyToken) {
     const activeEvent = SheetUtils.getActiveEvent();
@@ -332,14 +363,14 @@ const RegisterFlow = {
       LineApi.reply(replyToken, '現在募集中の開催がありません。主催者にご確認ください。');
       return;
     }
- 
+
     const state = {
       flow: 'register',
       step: null,
       spreadsheetUrl: activeEvent.spreadsheetUrl,
       data: {},
     };
- 
+
     const lastName = StateManager.getLastOrganizerName(userId);
     if (lastName) {
       state.step = 'CONFIRM_ORGANIZER_NAME';
@@ -354,7 +385,7 @@ const RegisterFlow = {
       LineApi.reply(replyToken, 'まず、あなた（動員する人）のお名前を教えてください。');
     }
   },
- 
+
   handle(state, userId, replyToken, text) {
     switch (state.step) {
       case 'CONFIRM_ORGANIZER_NAME':
@@ -367,18 +398,18 @@ const RegisterFlow = {
           LineApi.reply(replyToken, 'お名前を入力してください。');
         }
         return;
- 
+
       case 'ASK_ORGANIZER_NAME':
         state.data.organizerName = text;
         StateManager.setLastOrganizerName(userId, text);
         this._toAskGuestName(state, userId, replyToken);
         return;
- 
+
       case 'ASK_GUEST_NAME':
         state.data.guestName = text;
         this._toAskSlot(state, userId, replyToken);
         return;
- 
+
       case 'ASK_SLOT': {
         const ss = SheetUtils.openReservationSpreadsheet(state.spreadsheetUrl);
         const slots = SheetUtils.getSlotList(ss);
@@ -394,14 +425,14 @@ const RegisterFlow = {
           ['10代', '20代', '30代', '40代', '50代以上']);
         return;
       }
- 
+
       case 'ASK_AGE':
         state.data.age = text;
         state.step = 'ASK_GENDER';
         StateManager.set(userId, state);
         LineApi.reply(replyToken, '性別を教えてください。', ['女性', '男性', '回答しない']);
         return;
- 
+
       case 'ASK_GENDER': {
         state.data.gender = text;
         const ss = SheetUtils.openReservationSpreadsheet(state.spreadsheetUrl);
@@ -412,7 +443,7 @@ const RegisterFlow = {
         LineApi.reply(replyToken, '希望する対応者はいますか？', staffList);
         return;
       }
- 
+
       case 'ASK_STAFF': {
         state.data.staff = text;
         const ss = SheetUtils.openReservationSpreadsheet(state.spreadsheetUrl);
@@ -425,20 +456,20 @@ const RegisterFlow = {
           [...menu, '選び終わった']);
         return;
       }
- 
+
       case 'ASK_TREATMENT':
         this._handleTreatmentSelection(state, userId, replyToken, text, 'ASK_NOTE',
           () => LineApi.reply(replyToken,
             '伝えておきたいことがあれば教えてください（アレルギーなど）。', ['特になし']));
         return;
- 
+
       case 'ASK_NOTE':
         state.data.note = (text === '特になし') ? '' : text;
         state.step = 'CONFIRM';
         StateManager.set(userId, state);
         LineApi.reply(replyToken, this._buildConfirmText(state.data), ['この内容で登録', 'やり直す']);
         return;
- 
+
       case 'CONFIRM':
         if (text === 'この内容で登録') {
           this._save(state, userId, replyToken);
@@ -447,13 +478,13 @@ const RegisterFlow = {
           LineApi.reply(replyToken, '登録を中止しました。最初からやり直す場合は「登録」と送ってください。');
         }
         return;
- 
+
       default:
         StateManager.clear(userId);
         LineApi.reply(replyToken, 'エラーが発生しました。もう一度「登録」と送ってください。');
     }
   },
- 
+
   // 施術の複数選択（登録・変更フロー共通で使う）
   _handleTreatmentSelection(state, userId, replyToken, text, nextStep, onDone) {
     if (text === '選び終わった') {
@@ -476,13 +507,13 @@ const RegisterFlow = {
     LineApi.reply(replyToken, `「${text}」を選びました。他にもありますか？`,
       [...state.data.remainingTreatments, '選び終わった']);
   },
- 
+
   _toAskGuestName(state, userId, replyToken) {
     state.step = 'ASK_GUEST_NAME';
     StateManager.set(userId, state);
     LineApi.reply(replyToken, 'ゲストのお名前を教えてください。');
   },
- 
+
   _toAskSlot(state, userId, replyToken) {
     const ss = SheetUtils.openReservationSpreadsheet(state.spreadsheetUrl);
     const slots = SheetUtils.getSlotList(ss);
@@ -490,11 +521,17 @@ const RegisterFlow = {
     StateManager.set(userId, state);
     LineApi.reply(replyToken, 'ご希望の時間枠を選んでください。', slots.map(s => this._slotLabel(s)));
   },
- 
+
   _slotLabel(slot) {
-    return `${slot['枠名']}(${slot['開始時刻']})`;
+    const time = slot['開始時刻'];
+    // スプレッドシート側で時刻形式に入力されているとDateオブジェクトとして渡ってくるため、
+    // その場合はHH:mm形式の文字列に変換する（文字列で入っている場合はそのまま使う）
+    const timeStr = (time instanceof Date)
+      ? Utilities.formatDate(time, 'Asia/Tokyo', 'HH:mm')
+      : time;
+    return `${slot['枠名']}(${timeStr})`;
   },
- 
+
   _buildConfirmText(data) {
     return [
       '以下の内容で登録します。よろしいですか？',
@@ -505,27 +542,27 @@ const RegisterFlow = {
       `伝達事項：${data.note || 'なし'}`,
     ].join('\n');
   },
- 
+
   _save(state, userId, replyToken) {
     const ss = SheetUtils.openReservationSpreadsheet(state.spreadsheetUrl);
     const result = SheetUtils.appendReservation(ss, state.data);
     StateManager.clear(userId);
- 
+
     const guestMsg = (result.status === '受付')
       ? `受け付けました（予約No.${result.reservationId}）。`
       : `現在満枠のため「要確認」として登録しました（予約No.${result.reservationId}）。主催者確認後、あらためてご連絡します。`;
     LineApi.reply(replyToken, guestMsg);
- 
+
     SheetUtils.notifyOrganizers(
       `【新規登録】${state.data.organizerName}さんが${state.data.guestName}さんを登録しました` +
       `（枠:${state.data.slotNumber} / ステータス:${result.status}）`
     );
   },
 };
- 
+
 // ===== CancelFlow.gs =====
 // 「キャンセル」フロー：動員者名→ゲスト名→確認→ステータス更新
- 
+
 const CancelFlow = {
   start(userId, replyToken) {
     const activeEvent = SheetUtils.getActiveEvent();
@@ -611,10 +648,10 @@ const CancelFlow = {
     }
   },
 };
- 
- // ===== ConfirmFlow.gs =====
+
+// ===== ConfirmFlow.gs =====
 // 「登録確認」フロー：動員者名→本人の予約一覧を返信
- 
+
 const ConfirmFlow = {
   start(userId, replyToken) {
     const activeEvent = SheetUtils.getActiveEvent();
@@ -677,11 +714,11 @@ const ConfirmFlow = {
     LineApi.reply(replyToken, `${organizerName}さんの予約一覧です。\n` + lines.join('\n'));
   },
 };
- 
- // ===== ChangeFlow.gs =====
+
+// ===== ChangeFlow.gs =====
 // 「変更」フロー：対応者・施術・年齢性別・伝達事項のみ変更可能。
 // ゲスト名・時間枠を変えたい場合は、キャンセル→登録し直しの運用とする（合意済み）。
- 
+
 const ChangeFlow = {
   start(userId, replyToken) {
     const activeEvent = SheetUtils.getActiveEvent();
@@ -708,7 +745,7 @@ const ChangeFlow = {
       LineApi.reply(replyToken, 'あなた（動員する人）のお名前を教えてください。');
     }
   },
- 
+
   handle(state, userId, replyToken, text) {
     switch (state.step) {
       case 'CONFIRM_ORGANIZER_NAME':
@@ -805,7 +842,7 @@ const ChangeFlow = {
         StateManager.clear(userId);
     }
   },
- 
+
   _askNewValue(state, userId, replyToken) {
     const ss = SheetUtils.openReservationSpreadsheet(state.spreadsheetUrl);
  
@@ -834,7 +871,7 @@ const ChangeFlow = {
       LineApi.reply(replyToken, '新しい伝達事項を入力してください。', ['特になし']);
     }
   },
- 
+
   _afterTreatmentSelected(state, userId, replyToken) {
     state.data.newValue = state.data.treatments.join('、');
     state.step = 'CONFIRM';
@@ -842,7 +879,7 @@ const ChangeFlow = {
     LineApi.reply(replyToken, `施術を「${state.data.newValue}」に変更します。よろしいですか？`,
       ['この内容で変更', 'やめる']);
   },
- 
+
   _save(state, userId, replyToken) {
     const ss = SheetUtils.openReservationSpreadsheet(state.spreadsheetUrl);
     const fieldMap = {
@@ -866,3 +903,85 @@ const ChangeFlow = {
   },
 };
  
+ // ===== Main.gs =====
+// LINEからのWebhookを受け取る入口。
+// Webアプリとしてデプロイし、そのURLをLINE DevelopersのWebhook URLに設定してください。
+
+function doPost(e) {
+  try {
+    const body = JSON.parse(e.postData.contents);
+    const events = body.events || [];
+    events.forEach(handleEvent);
+  } catch (err) {
+    console.error('doPost error: ' + err);
+  }
+  // LINE Platformへは常に200 OKを返す
+  return ContentService.createTextOutput(JSON.stringify({ status: 'ok' }))
+    .setMimeType(ContentService.MimeType.JSON);
+}
+
+function handleEvent(event) {
+  const userId = event.source && event.source.userId;
+  if (!userId) return;
+
+  if (event.type === 'message' && event.message.type === 'text') {
+    handleTextMessage(userId, event.replyToken, event.message.text.trim());
+  }
+  // 将来リッチメニューをpostback形式にする場合はここにhandlePostbackを追加
+}
+
+function handleTextMessage(userId, replyToken, text) {
+  // 会話が止まってしまった場合の緊急リセット用
+  if (text === 'リセット') {
+    StateManager.clear(userId);
+    LineApi.reply(replyToken, '操作をリセットしました。「登録」「キャンセル」「登録確認」「変更」のいずれかを送ってください。');
+    return;
+  }
+
+  const state = StateManager.get(userId);
+
+  if (!state) {
+    // 会話中でない場合は、トリガーワードとして判定する
+    const flow = matchTrigger(text);
+    if (flow) {
+      startFlow(flow, userId, replyToken);
+    } else {
+      LineApi.reply(replyToken,
+        'メニューから「登録」「キャンセル」「登録確認」「変更」のいずれかを送ってください。');
+    }
+    return;
+  }
+
+  // 会話中の場合は、現在のステップの続きとして処理する
+  routeToFlow(state, userId, replyToken, text);
+}
+
+function matchTrigger(text) {
+  if (text === '登録') return 'register';
+  if (text === 'キャンセル') return 'cancel';
+  if (text === '登録確認') return 'confirm';
+  if (text === '変更') return 'change';
+  return null;
+}
+
+function startFlow(flow, userId, replyToken) {
+  switch (flow) {
+    case 'register': return RegisterFlow.start(userId, replyToken);
+    case 'cancel': return CancelFlow.start(userId, replyToken);
+    case 'confirm': return ConfirmFlow.start(userId, replyToken);
+    case 'change': return ChangeFlow.start(userId, replyToken);
+  }
+}
+
+function routeToFlow(state, userId, replyToken, text) {
+  switch (state.flow) {
+    case 'register': return RegisterFlow.handle(state, userId, replyToken, text);
+    case 'cancel': return CancelFlow.handle(state, userId, replyToken, text);
+    case 'confirm': return ConfirmFlow.handle(state, userId, replyToken, text);
+    case 'change': return ChangeFlow.handle(state, userId, replyToken, text);
+    default:
+      StateManager.clear(userId);
+      LineApi.reply(replyToken, 'エラーが発生しました。もう一度メニューから選び直してください。');
+  }
+}
+
