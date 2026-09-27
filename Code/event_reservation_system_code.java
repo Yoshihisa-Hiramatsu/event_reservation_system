@@ -337,6 +337,65 @@ const SheetUtils = {
     sheet.getRange(rowIndex, col).setValue(value);
   },
 
+  // 当日スケジュール（行=枠、列=対応者）を対応者一覧・枠マスタ・予約タブから作り直す。
+  // 「確定担当者」が入っている予約だけを反映する。同じ枠・同じ対応者に2人以上いる
+  // セルはオレンジ色で目立たせる。戻り値は重複セルの件数。
+  buildDaySchedule(ss) {
+    const sheet = ss.getSheetByName('当日スケジュール');
+    sheet.clear();
+
+    const staffList = this.getStaffList(ss).map(s => s['対応者名']).filter(v => v !== '');
+    const slots = this.getSlotList(ss)
+      .filter(s => s['枠番号'] !== '')
+      .sort((a, b) => Number(a['枠番号']) - Number(b['枠番号']));
+
+    sheet.getRange(1, 1).setValue('枠＼対応者');
+    staffList.forEach((staff, i) => sheet.getRange(1, 2 + i).setValue(staff));
+    slots.forEach((slot, i) => {
+      sheet.getRange(2 + i, 1).setValue(`${slot['枠名']}(${slot['開始時刻']})`);
+    });
+
+    if (staffList.length > 0) {
+      sheet.getRange(1, 1, 1, staffList.length + 1)
+        .setBackground('#0F6E56').setFontColor('#FFFFFF').setFontWeight('bold');
+    }
+    if (slots.length > 0) {
+      sheet.getRange(1, 1, slots.length + 1, 1)
+        .setBackground('#0F6E56').setFontColor('#FFFFFF').setFontWeight('bold');
+    }
+    sheet.setFrozenRows(1);
+    sheet.setFrozenColumns(1);
+
+    // 「確定担当者」が入っている予約（キャンセル除く）だけを集計する
+    const reservations = this.getReservations(ss)
+      .filter(r => r['ステータス'] !== 'キャンセル' && r['確定担当者']);
+
+    const cellMap = {}; // "枠番号|担当者名" -> ["動員する人／ゲスト名", ...]
+    reservations.forEach(r => {
+      const slotNumber = (r['確定枠番号'] !== '' && r['確定枠番号'] !== undefined)
+        ? r['確定枠番号'] : r['枠番号'];
+      const key = slotNumber + '|' + r['確定担当者'];
+      if (!cellMap[key]) cellMap[key] = [];
+      cellMap[key].push(`${r['動員する人']}／${r['ゲスト名']}`);
+    });
+
+    let duplicateCount = 0;
+    slots.forEach((slot, rowOffset) => {
+      staffList.forEach((staff, colOffset) => {
+        const entries = cellMap[String(slot['枠番号']) + '|' + staff];
+        if (!entries) return;
+        const cell = sheet.getRange(2 + rowOffset, 2 + colOffset);
+        cell.setValue(entries.join('、'));
+        if (entries.length > 1) {
+          cell.setBackground('#FDECC8'); // 1人が複数ゲストを担当＝重複を目立たせる
+          duplicateCount++;
+        }
+      });
+    });
+
+    return duplicateCount;
+  },
+
   // 主催者通知先（通知ON/OFF=ONの人）全員にLINE通知
   notifyOrganizers(message) {
     const sheet = this.getControlSheet().getSheetByName(SHEET_NAMES.NOTIFY_LIST);
