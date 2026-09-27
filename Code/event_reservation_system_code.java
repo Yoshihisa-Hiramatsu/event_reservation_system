@@ -358,6 +358,10 @@ const SheetUtils = {
     if (staffList.length > 0) {
       sheet.getRange(1, 1, 1, staffList.length + 1)
         .setBackground('#0F6E56').setFontColor('#FFFFFF').setFontWeight('bold');
+      // ゲスト名・施術まで表示すると横幅が必要なので、対応者の列を広めにしておく
+      for (let i = 0; i < staffList.length; i++) {
+        sheet.setColumnWidth(2 + i, 220);
+      }
     }
     if (slots.length > 0) {
       sheet.getRange(1, 1, slots.length + 1, 1)
@@ -370,13 +374,14 @@ const SheetUtils = {
     const reservations = this.getReservations(ss)
       .filter(r => r['ステータス'] !== 'キャンセル' && r['確定担当者']);
 
-    const cellMap = {}; // "枠番号|担当者名" -> ["動員する人／ゲスト名", ...]
+    const cellMap = {}; // "枠番号|担当者名" -> ["ゲスト名\n（動員する人）\n施術", ...]
     reservations.forEach(r => {
       const slotNumber = (r['確定枠番号'] !== '' && r['確定枠番号'] !== undefined)
         ? r['確定枠番号'] : r['枠番号'];
       const key = slotNumber + '|' + r['確定担当者'];
       if (!cellMap[key]) cellMap[key] = [];
-      cellMap[key].push(`${r['動員する人']}／${r['ゲスト名']}`);
+      const treatment = r['希望する施術'] || '';
+      cellMap[key].push(`${r['ゲスト名']}\n（${r['動員する人']}）\n${treatment}`);
     });
 
     let duplicateCount = 0;
@@ -385,13 +390,19 @@ const SheetUtils = {
         const entries = cellMap[String(slot['枠番号']) + '|' + staff];
         if (!entries) return;
         const cell = sheet.getRange(2 + rowOffset, 2 + colOffset);
-        cell.setValue(entries.join('、'));
+        // 1件＝3行（ゲスト名／動員する人／施術）。複数件ある場合は空行で区切って積む
+        cell.setValue(entries.join('\n\n')).setWrap(true).setVerticalAlignment('top');
         if (entries.length > 1) {
           cell.setBackground('#FDECC8'); // 1人が複数ゲストを担当＝重複を目立たせる
           duplicateCount++;
         }
       });
     });
+
+    // 複数人が入っているセル（改行あり）があっても読めるよう、全体の行の高さを自動調整する
+    if (slots.length > 0 && staffList.length > 0) {
+      sheet.autoResizeRows(2, slots.length);
+    }
 
     return duplicateCount;
   },
@@ -1044,3 +1055,25 @@ function routeToFlow(state, userId, replyToken, text) {
   }
 }
 
+// ===== Menu.gs =====
+// 「開催別ひな形」のスプレッドシートを開いた時に独自メニューを表示する。
+// このコードは、開催ごとに複製する予約シートファイル側のGASプロジェクトに入れてください
+// （親シートではなく、対応者一覧・枠マスタ・予約タブなどが入っているファイルの方です）。
+
+function onOpen() {
+  SpreadsheetApp.getUi()
+    .createMenu('予約管理')
+    .addItem('当日スケジュールを作成・更新', 'menu_buildDaySchedule')
+    .addToUi();
+}
+
+function menu_buildDaySchedule() {
+  const ss = SpreadsheetApp.getActiveSpreadsheet();
+  const duplicateCount = SheetUtils.buildDaySchedule(ss);
+
+  const message = (duplicateCount > 0)
+    ? `当日スケジュールを更新しました。\n同じ対応者に複数ゲストが割り当てられているセルが ${duplicateCount} 件あります（オレンジ色のセル）。`
+    : '当日スケジュールを更新しました。重複はありません。';
+
+  SpreadsheetApp.getUi().alert(message);
+}
