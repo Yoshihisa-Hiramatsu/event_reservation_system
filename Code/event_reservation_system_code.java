@@ -1077,3 +1077,4 @@ function menu_buildDaySchedule() {
 
   SpreadsheetApp.getUi().alert(message);
 }
+
