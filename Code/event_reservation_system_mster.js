@@ -33,8 +33,8 @@ const RES_DATA_COLS = 14; // 値を読み書きする列数（O・P列は数式�
 const STATUS = { ACCEPTED: '受付', PENDING: '要確認', CANCELED: 'キャンセル', CHANGED: '変更済' };
 
 // 設定タブが無い・空欄のときに使う初期値（美容イベント版）
-// enabled を false にできる項目: organizer / age / gender / staff / menu / note
-// （guest と slot は必須なので常にON）
+// enabled を false にできる項目: organizer / slot / age / gender / staff / menu / note
+// （guest は必須なので常にON。slot をOFFにすると時間枠を使わない開催＝全員同じ開始時刻のイベントになる）
 const DEFAULT_SETTINGS = {
   organizer: { label: '動員する人', question: 'あなた（動員する人）のお名前を教えてください。', enabled: true, choices: [] },
   guest: { label: 'ゲスト名', question: 'ゲストのお名前を教えてください。', enabled: true, choices: [] },
@@ -243,6 +243,7 @@ function onOpen() {
     .addItem('新しい開催を作成（ひな形から複製）', 'menu_createEvent')
     .addItem('当日スケジュールと要確認リストを更新', 'menu_buildDaySchedule')
     .addItem('予約タブの見出しを設定に合わせる', 'menu_applyHeaders')
+    .addItem('設定の読み込みを確認', 'menu_checkSettings')
     .addToUi();
 }
 
@@ -309,9 +310,13 @@ function menu_buildDaySchedule() {
   const pendingCount = SheetUtils.buildPendingList(ss);
 
   const lines = [`「${event.name}」を更新しました。`];
-  lines.push(duplicateCount > 0
-    ? `同じ対応者に複数ゲストが割り当てられているセルが ${duplicateCount} 件あります（オレンジ色のセル）。`
-    : '当日スケジュールに重複はありません。');
+  if (!Settings.isOn(Settings.load(ss), 'slot')) {
+    lines.push('時間枠を使わない開催なので、当日スケジュールは参加者の一覧（名簿）として作成しました。');
+  } else {
+    lines.push(duplicateCount > 0
+      ? `同じ対応者に複数ゲストが割り当てられているセルが ${duplicateCount} 件あります（オレンジ色のセル）。`
+      : '当日スケジュールに重複はありません。');
+  }
   lines.push(`要確認の予約：${pendingCount} 件`);
   ui.alert(lines.join('\n'));
 }
@@ -327,6 +332,16 @@ function menu_applyHeaders() {
   ui.alert(`「${event.name}」の予約タブの見出しを、設定タブの表示名に合わせました。`);
 }
 
+// ---------- 設定の読み込みを確認 ----------
+// LINEのBotが「どのファイルの設定タブを、どう読んでいるか」を表示する
+function menu_checkSettings() {
+  const ui = SpreadsheetApp.getUi();
+  const event = EventAdmin.pickEvent_('設定を確認する開催を選んでください');
+  if (!event) return;
+  const ss = SheetUtils.openReservationSpreadsheet(event.spreadsheetUrl);
+  ui.alert('設定の読み込み結果', Settings.describe(ss, event.name), ui.ButtonSet.OK);
+}
+
 // ===== Settings.gs =====
 // 開催別シートの「設定」タブを読み込む。タブが無い・空欄・「…」だけの項目は、Config.gsの初期値を使う。
 //
@@ -334,7 +349,7 @@ function menu_applyHeaders() {
 // 選択肢はカンマ（, 、 ，）区切り。
 
 const Settings = {
-  REQUIRED: ['guest', 'slot'], // OFFにできない項目
+  REQUIRED: ['guest'], // OFFにできない項目
 
   load(ss) {
     const st = {};
@@ -345,7 +360,7 @@ const Settings = {
     const sheet = ss.getSheetByName(SHEET_NAMES.SETTINGS);
     if (sheet) {
       sheet.getDataRange().getDisplayValues().slice(1).forEach(r => {
-        const key = String(r[0]).trim();
+        const key = Util.toHalfWidth(r[0]).trim();
         const item = st[key];
         if (!item) return;
 
@@ -357,7 +372,7 @@ const Settings = {
           if (key.indexOf('msg_') === 0) item.text = body; else item.question = body;
         }
 
-        const onoff = String(r[3]).trim().toUpperCase();
+        const onoff = this._onoff(r[3]);
         if (onoff === 'OFF') item.enabled = false;
         if (onoff === 'ON') item.enabled = true;
 
@@ -367,6 +382,14 @@ const Settings = {
     }
     this.REQUIRED.forEach(key => { st[key].enabled = true; });
     return st;
+  },
+
+  // 「ON」「OFF」のほか、全角・小文字・「オフ」「×」なども読み取る。判定できなければ ''
+  _onoff(value) {
+    const v = Util.toHalfWidth(value === null || value === undefined ? '' : value).trim().toUpperCase();
+    if (['OFF', 'オフ', '×', '✕', 'NO', 'いいえ', '使わない'].indexOf(v) !== -1) return 'OFF';
+    if (['ON', 'オン', '○', '〇', 'YES', 'はい', '使う'].indexOf(v) !== -1) return 'ON';
+    return '';
   },
 
   isOn(st, key) {
@@ -394,6 +417,37 @@ const Settings = {
       st.staff.label, st.menu.label, st.note.label, '登録日時', 'ステータス',
       '確定' + st.staff_role.label, '確定枠番号', '主催者メモ', '枠表示', '重複チェック',
     ]]);
+  },
+
+  // 「どのファイルの設定を、どう読み込んだか」を確認用の文章にする（親シートのメニューから使う）
+  describe(ss, eventName) {
+    const lines = [`開催：${eventName}`, `読み込んだファイル：${ss.getName()}`];
+    const sheet = ss.getSheetByName(SHEET_NAMES.SETTINGS);
+    if (!sheet) {
+      lines.push('', '⚠ このファイルに「設定」タブがありません。標準の文言（美容版）で動いています。');
+      return lines.join('\n');
+    }
+    const st = this.load(ss);
+    const rows = sheet.getDataRange().getDisplayValues().slice(1);
+    const known = Object.keys(DEFAULT_SETTINGS);
+    lines.push('');
+    rows.forEach(r => {
+      const key = Util.toHalfWidth(r[0]).trim();
+      if (key === '') return;
+      if (known.indexOf(key) === -1) {
+        lines.push(`⚠ 「${key}」は認識できない内部キーです（無視されます）`);
+        return;
+      }
+      const item = st[key];
+      const body = key.indexOf('msg_') === 0 ? item.text : item.question;
+      const sheetBody = String(r[2]).trim();
+      const ignored = sheetBody !== '' && this._text(sheetBody) === '';
+      const flag = this.REQUIRED.indexOf(key) !== -1 ? 'ON(必須)' : (item.enabled ? 'ON' : 'OFF');
+      lines.push(`${key}：${flag}／${item.label}` + (body ? `／${body}` : '') + (ignored ? '　※質問文が「…」で終わっているため標準の文言を使用' : ''));
+    });
+    const missing = known.filter(k => !rows.some(r => Util.toHalfWidth(r[0]).trim() === k));
+    if (missing.length > 0) lines.push('', '設定タブに無い行（標準の設定を使用）：' + missing.join(', '));
+    return lines.join('\n');
   },
 };
 
@@ -666,8 +720,8 @@ const RegisterFlow = {
     const lines = [
       `「${state.eventName}」に以下の内容で登録します。よろしいですか？`,
       `${st.guest.label}：${d.guestName}`,
-      `${st.slot.label}：${d.slotText}`,
     ];
+    if (Settings.isOn(st, 'slot') && d.slotText) lines.push(`${st.slot.label}：${d.slotText}`);
     if (Settings.isOn(st, 'age') && d.age !== undefined) lines.push(`${st.age.label}：${d.age}`);
     if (Settings.isOn(st, 'gender') && d.gender !== undefined) lines.push(`${st.gender.label}：${d.gender}`);
     if (d.staff !== undefined) lines.push(`${st.staff.label}：${d.staff}`);
@@ -687,7 +741,7 @@ const RegisterFlow = {
     const who = (d.organizerName && d.organizerName !== d.guestName)
       ? `${d.organizerName}さんが${d.guestName}さんを` : `${d.guestName}さんが`;
     SheetUtils.notifyOrganizers(
-      `【新規登録】[${state.eventName}] ${who}登録しました（${d.slotText} / ステータス:${result.status}）`
+      `【新規登録】[${state.eventName}] ${who}登録しました（${[d.slotText, 'ステータス:' + result.status].filter(Boolean).join(' / ')}）`
     );
   },
 };
@@ -890,8 +944,11 @@ const ConfirmFlow = {
       return;
     }
 
-    const lines = reservations.map(r =>
-      `・${r.guest}様／${slotMap[Number(r.slot)] || '枠' + r.slot}／ステータス:${r.status}`);
+    // 時間枠を使わない開催では枠の表示を省く
+    const lines = reservations.map(r => {
+      const slotText = (r.slot === '' || r.slot === undefined) ? '' : (slotMap[Number(r.slot)] || '枠' + r.slot);
+      return '・' + [`${r.guest}様`, slotText, `ステータス:${r.status}`].filter(Boolean).join('／');
+    });
     LineApi.reply(replyToken, `「${state.eventName}」の${name}さんの予約一覧です。\n` + lines.join('\n'));
   },
 };
@@ -1207,15 +1264,20 @@ const SheetUtils = {
     const blankIndex = idValues.findIndex(v => v === '' || v === null || v === undefined);
     const targetRow = (blankIndex === -1) ? lastRow + 1 : blankIndex + 2; // +2はA2始まりのオフセット
 
-    const slots = this.getSlotList(ss);
-    const slot = slots.find(s => Number(s['枠番号']) === Number(data.slotNumber));
-    const capacity = slot ? Number(slot['受付可能人数']) : 0;
-    const currentCount = this.countReservationsInSlot(ss, data.slotNumber);
-    const status = (currentCount + 1) > capacity ? STATUS.PENDING : STATUS.ACCEPTED;
+    // 時間枠を使わない開催（slot=OFF）では、枠の定員チェックはせず常に「受付」にする
+    const hasSlot = data.slotNumber !== undefined && data.slotNumber !== '' && data.slotNumber !== null;
+    let status = STATUS.ACCEPTED;
+    if (hasSlot) {
+      const slots = this.getSlotList(ss);
+      const slot = slots.find(s => Number(s['枠番号']) === Number(data.slotNumber));
+      const capacity = slot ? Number(slot['受付可能人数']) : 0;
+      const currentCount = this.countReservationsInSlot(ss, data.slotNumber);
+      status = (currentCount + 1) > capacity ? STATUS.PENDING : STATUS.ACCEPTED;
+    }
 
     sheet.getRange(targetRow, 1, 1, RES_DATA_COLS).setValues([[
       newId,
-      data.slotNumber,
+      hasSlot ? data.slotNumber : '',
       data.organizerName || '',
       data.guestName,
       data.age || '',
@@ -1273,6 +1335,9 @@ const SheetUtils = {
     if (!sheet) sheet = ss.insertSheet(SHEET_NAMES.DAY_SCHEDULE);
     sheet.clear();
     sheet.getRange(1, 1, sheet.getMaxRows(), sheet.getMaxColumns()).clearNote();
+
+    // 時間枠を使わない開催は、枠×対応者の表を作れないので、参加者の一覧（名簿）にする
+    if (!Settings.isOn(st, 'slot')) return this._buildGuestList(ss, st, sheet);
 
     const staffList = this.getStaffList(ss);
     const slots = this.getSlotList(ss)
@@ -1336,6 +1401,34 @@ const SheetUtils = {
     }
 
     return duplicateCount;
+  },
+
+  // 時間枠を使わない開催用：キャンセル以外の予約を、動員する人ごとの名簿にする。戻り値は常に0（重複の概念がない）
+  _buildGuestList(ss, st, sheet) {
+    const cols = []; // [見出し, 取り出し方]
+    if (Settings.isOn(st, 'organizer')) cols.push([st.organizer.label, r => r.organizer]);
+    cols.push([st.guest.label, r => r.guest]);
+    if (Settings.isOn(st, 'age')) cols.push([st.age.label, r => r.age]);
+    if (Settings.isOn(st, 'gender')) cols.push([st.gender.label, r => r.gender]);
+    if (Settings.isOn(st, 'staff')) cols.push([st.staff.label, r => r.staff]);
+    if (Settings.isOn(st, 'menu')) cols.push([st.menu.label, r => r.menu]);
+    if (Settings.isOn(st, 'note')) cols.push([st.note.label, r => r.note]);
+    if (Settings.isOn(st, 'staff')) cols.push(['確定' + st.staff_role.label, r => r.confirmedStaff]);
+    cols.push(['ステータス', r => r.status]);
+
+    sheet.getRange(1, 1, 1, cols.length).setValues([cols.map(c => c[0])])
+      .setBackground('#0F6E56').setFontColor('#FFFFFF').setFontWeight('bold');
+    sheet.setFrozenRows(1);
+    for (let i = 0; i < cols.length; i++) sheet.setColumnWidth(1 + i, 160);
+
+    const rows = this.getReservations(ss)
+      .filter(r => r.status !== STATUS.CANCELED)
+      .sort((a, b) => String(a.organizer).localeCompare(String(b.organizer), 'ja') || Number(a.id) - Number(b.id))
+      .map(r => cols.map(c => c[1](r)));
+    if (rows.length > 0) {
+      sheet.getRange(2, 1, rows.length, cols.length).setValues(rows).setWrap(true).setVerticalAlignment('top');
+    }
+    return 0;
   },
 
   // 要確認リスト：ステータスが「要確認」の予約だけを一覧にする。戻り値は件数
@@ -1410,9 +1503,9 @@ const StateManager = {
 
 // ===== Util.gs =====
 const Util = {
-  // 全角数字を半角に（「１」と入力されても番号として扱えるように）
+  // 全角の数字・英字を半角に（「１」「ＯＦＦ」と入力されても読めるように）
   toHalfWidth(s) {
-    return String(s).replace(/[０-９]/g, c => String.fromCharCode(c.charCodeAt(0) - 0xFEE0));
+    return String(s).replace(/[０-９Ａ-Ｚａ-ｚ]/g, c => String.fromCharCode(c.charCodeAt(0) - 0xFEE0));
   },
 
   // 「{no}」のような差し込み文字を置き換える
