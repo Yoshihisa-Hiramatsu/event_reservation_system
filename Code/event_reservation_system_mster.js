@@ -781,12 +781,15 @@ const RegisterFlow = {
 };
 
 // ===== ChangeFlow.gs =====
-// 「変更」フロー：希望対応者・メニュー・年齢・性別・伝達事項（設定でONの項目）だけ変更できる。
-// ゲスト名・時間枠を変えたい場合は、キャンセル→登録し直しの運用とする（合意済み）。
+// 「変更」フロー：時間枠・希望対応者・メニュー・伝達事項（設定でONの項目）を変更できる。
+// ゲスト名を変えたい場合は、キャンセル→登録し直しの運用とする（合意済み）。
 
-const CHANGEABLE_KEYS = ['staff', 'menu', 'age', 'gender', 'note'];
+// 変更できる項目（設定でONのものだけ）。年齢・性別は入力ミスの訂正用
+const CHANGEABLE_KEYS = ['slot', 'staff', 'menu', 'age', 'gender', 'note'];
 
 const ChangeFlow = {
+  DONE: 'ない（確認へ進む）',
+
   start(userId, replyToken, event) {
     const ss = SheetUtils.openReservationSpreadsheet(event.spreadsheetUrl);
     const st = Settings.load(ss);
@@ -807,27 +810,36 @@ const ChangeFlow = {
 
     if (Identity.isOrganizerStep(state)) {
       if (Identity.handleOrganizerStep(state, userId, replyToken, text)) {
-        state.step = 'ASK_GUEST_NAME';
-        StateManager.set(userId, state);
-        LineApi.reply(replyToken, `変更する「${st.guest.label}」を教えてください。`);
+        Identity.showList(state, userId, replyToken, ss, '変更');
       }
       return;
     }
 
     switch (state.step) {
-      case 'ASK_GUEST_NAME': {
-        if (state.data.selfMode) state.data.organizerName = text;
-        const matches = SheetUtils.findReservation(ss, state.data.organizerName, text);
-        if (matches.length === 0) {
-          LineApi.reply(replyToken, '該当する予約が見つかりませんでした。');
+      // 本人モード（動員する人OFF）：入力された名前＝予約した人
+      case 'ASK_GUEST_NAME':
+        state.data.organizerName = text;
+        Identity.showList(state, userId, replyToken, ss, '変更');
+        return;
+
+      // 一覧を見て、番号または名前で変更する予約を選ぶ
+      case 'PICK_RESERVATION': {
+        if (text === 'やめる') {
           StateManager.clear(userId);
+          LineApi.reply(replyToken, '変更を中止しました。');
           return;
         }
-        state.data.guestName = text;
-        state.data.rowIndex = matches[0].rowIndex;
+        const picked = Identity.pick(state, replyToken, ss, text);
+        if (picked.done) return;
+        const target = picked.reservation;
+        state.data.guestName = target.guest;
+        state.data.rowIndex = target.rowIndex;
+        state.data.reservationId = target.id;
         state.step = 'ASK_TARGET';
         StateManager.set(userId, state);
-        LineApi.reply(replyToken, '何を変更しますか？', this._targets(st).map(k => st[k].label));
+        LineApi.reply(replyToken,
+          `No.${target.id} ${target.guest}さんの予約を変更します。\n何を変更しますか？`,
+          this._targets(st).map(k => st[k].label));
         return;
       }
 
@@ -838,7 +850,65 @@ const ChangeFlow = {
           return;
         }
         state.data.target = key;
+        state.data.updates = {};
         this._askNewValue(state, userId, replyToken, ss, st);
+        return;
+      }
+
+      // 他にも変更する項目があるかを聞く
+      case 'ASK_MORE': {
+        if (text === ChangeFlow.DONE) {
+          this._toConfirm(state, userId, replyToken, ss, st);
+          return;
+        }
+        const key = this._remaining(state, st).find(k => st[k].label === text);
+        if (!key) {
+          this._askMore(state, userId, replyToken, ss, st, '選択肢の中から選んでください。\n');
+          return;
+        }
+        state.data.target = key;
+        this._askNewValue(state, userId, replyToken, ss, st);
+        return;
+      }
+
+      // 新しい時間枠（空きのある枠だけ。いまの枠は除く）
+      case 'INPUT_NEW_SLOT': {
+        const current = this._current(ss, state);
+        const slot = this._availableSlots(ss, current).find(s => SheetUtils.slotLabel(s) === text);
+        if (!slot) {
+          LineApi.reply(replyToken, '選択肢の中から選んでください。',
+            this._availableSlots(ss, current).map(s => SheetUtils.slotLabel(s)));
+          return;
+        }
+        state.data.updates.slot = slot['枠番号'];
+        // 希望する対応者が、新しい枠に対応していなければ、選び直してもらう
+        if (Settings.isOn(st, 'staff') && current.staff !== '' && current.staff !== undefined) {
+          const eligible = SheetUtils.getStaffForSlot(ss, slot['枠番号']);
+          if (eligible.indexOf(current.staff) === -1 && st.staff.choices.indexOf(current.staff) === -1) {
+            const options = [...eligible, ...st.staff.choices];
+            if (options.length > 0) {
+              state.step = 'INPUT_STAFF_AFTER_SLOT';
+              StateManager.set(userId, state);
+              LineApi.reply(replyToken,
+                `「${current.staff}」さんは${SheetUtils.slotLabel(slot)}に対応できません。\n新しい「${st.staff.label}」を選んでください。`,
+                options);
+              return;
+            }
+            state.data.updates.staff = '';
+          }
+        }
+        this._askMore(state, userId, replyToken, ss, st, '');
+        return;
+      }
+
+      case 'INPUT_STAFF_AFTER_SLOT': {
+        const options = [...SheetUtils.getStaffForSlot(ss, state.data.updates.slot), ...st.staff.choices];
+        if (!options.includes(text)) {
+          LineApi.reply(replyToken, '選択肢の中から選んでください。', options);
+          return;
+        }
+        state.data.updates.staff = text;
+        this._askMore(state, userId, replyToken, ss, st, '');
         return;
       }
 
@@ -852,15 +922,15 @@ const ChangeFlow = {
           }
         }
         const none = st.note.choices[0] || '特になし';
-        state.data.newValue = (key === 'note' && text === none) ? '' : text;
-        this._toConfirm(state, userId, replyToken, st, text);
+        state.data.updates[key] = (key === 'note' && text === none) ? '' : text;
+        this._askMore(state, userId, replyToken, ss, st, '');
         return;
       }
 
       case 'INPUT_NEW_VALUE_MENU':
         RegisterFlow._handleMenuSelection(state, userId, replyToken, text, () => {
-          state.data.newValue = state.data.treatments.join('、');
-          this._toConfirm(state, userId, replyToken, st, state.data.newValue);
+          state.data.updates.menu = state.data.treatments.join('、');
+          this._askMore(state, userId, replyToken, ss, st, '');
         });
         return;
 
@@ -878,13 +948,50 @@ const ChangeFlow = {
     }
   },
 
-  // 設定でONになっていて、変更の対象にできる項目
+  // まだ変更していない項目（変更先の空きがなくて選べない項目は除く）
+  _remaining(state, st) {
+    const done = Object.keys(state.data.updates || {});
+    const unavailable = state.data.unavailable || [];
+    return this._targets(st).filter(k => done.indexOf(k) === -1 && unavailable.indexOf(k) === -1);
+  },
+
+  // 「他に変更しますか？」。変更した項目が1つ以上あれば「ない（確認へ進む）」も出す
+  _askMore(state, userId, replyToken, ss, st, prefix) {
+    const remaining = this._remaining(state, st);
+    const changed = Object.keys(state.data.updates || {}).length > 0;
+    if (remaining.length === 0) {
+      if (!changed) {
+        StateManager.clear(userId);
+        LineApi.reply(replyToken, prefix + '変更できる項目がありません。');
+        return;
+      }
+      this._toConfirm(state, userId, replyToken, ss, st); // 全部変更ずみ → そのまま確認へ
+      return;
+    }
+    state.step = 'ASK_MORE';
+    StateManager.set(userId, state);
+    const choices = remaining.map(k => st[k].label);
+    if (changed) choices.push(ChangeFlow.DONE);
+    LineApi.reply(replyToken, prefix + '他に変更する項目はありますか？', choices);
+  },
+
+  _current(ss, state) {
+    return SheetUtils.getReservations(ss).find(r => r.rowIndex === state.data.rowIndex);
+  },
+
+  // 変更先に選べる時間枠：空きがある枠（いまの枠は除く）
+  _availableSlots(ss, current) {
+    return SheetUtils.getAvailableSlots(ss)
+      .filter(s => !(current && current.slot !== '' && Number(s['枠番号']) === Number(current.slot)));
+  },
+
   // 変更対象の予約の枠で対応できる人（枠が無い予約は全員）＋「誰でも良い」など
   _staffOptions(ss, st, rowIndex) {
     const r = SheetUtils.getReservations(ss).find(x => x.rowIndex === rowIndex);
     return [...SheetUtils.getStaffForSlot(ss, r ? r.slot : ''), ...st.staff.choices];
   },
 
+  // 設定でONになっていて、変更の対象にできる項目
   _targets(st) {
     return CHANGEABLE_KEYS.filter(k => Settings.isOn(st, k));
   },
@@ -893,7 +1000,18 @@ const ChangeFlow = {
     const key = state.data.target;
     const label = st[key].label;
 
-    if (key === 'staff') {
+    if (key === 'slot') {
+      const options = this._availableSlots(ss, this._current(ss, state));
+      if (options.length === 0) {
+        // 空き枠がないときは、他の項目の選択に戻す
+        state.data.unavailable = (state.data.unavailable || []).concat('slot');
+        this._askMore(state, userId, replyToken, ss, st, `申し訳ありません。現在、変更できる空きの${label}がありません。\n`);
+        return;
+      }
+      state.step = 'INPUT_NEW_SLOT';
+      StateManager.set(userId, state);
+      LineApi.reply(replyToken, `新しい「${label}」を選んでください。`, options.map(s => SheetUtils.slotLabel(s)));
+    } else if (key === 'staff') {
       state.step = 'INPUT_NEW_VALUE';
       StateManager.set(userId, state);
       LineApi.reply(replyToken, `新しい「${label}」を選んでください。`,
@@ -914,28 +1032,53 @@ const ChangeFlow = {
     }
   },
 
-  _toConfirm(state, userId, replyToken, st, shownValue) {
+  // 変更後の内容（変更した項目に「（変更）」付き）を見せて確認する
+  _toConfirm(state, userId, replyToken, ss, st) {
+    const d = state.data;
     state.step = 'CONFIRM';
     StateManager.set(userId, state);
-    const label = st[state.data.target].label;
-    LineApi.reply(replyToken, `「${label}」を「${shownValue}」に変更します。よろしいですか？`,
+    const after = Object.assign({}, this._current(ss, state), d.updates);
+    LineApi.reply(replyToken,
+      `No.${d.reservationId} ${d.guestName}さんの予約を変更します。\n変更後の内容：\n${Identity.describe(ss, st, after, Object.keys(d.updates))}\nよろしいですか？`,
       ['この内容で変更', 'やめる']);
   },
 
   _save(state, userId, replyToken, ss, st) {
     const d = state.data;
-    SheetUtils.updateReservationField(ss, d.rowIndex, d.target, d.newValue);
+    const before = this._current(ss, state);
+
+    // 枠を変える場合は、確認している間に満席になっていないかを見直す
+    if (d.updates.slot !== undefined) {
+      const stillOpen = SheetUtils.getAvailableSlots(ss).some(s => Number(s['枠番号']) === Number(d.updates.slot));
+      if (!stillOpen) {
+        StateManager.clear(userId);
+        LineApi.reply(replyToken, '申し訳ありません。その枠は満席になりました。お手数ですが、もう一度「変更」からやり直してください。');
+        return;
+      }
+    }
+
+    Object.keys(d.updates).forEach(key => SheetUtils.updateReservationField(ss, d.rowIndex, key, d.updates[key]));
+    // 主催者が「確定枠番号」を入れていた場合は、古い枠を指したままにならないよう外す
+    if (d.updates.slot !== undefined) SheetUtils.updateReservationField(ss, d.rowIndex, 'confirmedSlot', '');
 
     // 「要確認」の予約は、変更しても要確認のままにする（満枠の確認が消えないように）
-    const current = SheetUtils.getReservations(ss).find(r => r.rowIndex === d.rowIndex);
-    if (!current || current.status !== STATUS.PENDING) {
+    if (!before || before.status !== STATUS.PENDING) {
       SheetUtils.updateReservationStatus(ss, d.rowIndex, STATUS.CHANGED);
     }
 
     LineApi.reply(replyToken, '変更しました。');
     const who = (d.organizerName !== d.guestName)
       ? `${d.organizerName}さんが${d.guestName}さんの予約を` : `${d.guestName}さんが予約を`;
-    SheetUtils.notifyOrganizers(`【変更】[${state.eventName}] ${who}変更しました（${st[d.target].label}）。`);
+    const labels = Object.keys(d.updates).map(k => st[k].label).join('・');
+    let detail = '';
+    if (d.updates.slot !== undefined) {
+      const slotMap = {};
+      SheetUtils.getSlotList(ss).forEach(s => { slotMap[Number(s['枠番号'])] = SheetUtils.slotLabel(s); });
+      const from = (before && before.slot !== '') ? (slotMap[Number(before.slot)] || '枠' + before.slot) : '（枠なし）';
+      detail = `\n${st.slot.label}：${from} → ${slotMap[Number(d.updates.slot)]}`;
+      if (before && before.confirmedStaff) detail += `\n※${st.staff_role.label}を確定済みでした。確認してください。`;
+    }
+    SheetUtils.notifyOrganizers(`【変更】[${state.eventName}] ${who}変更しました（${labels}）。${detail}`);
     StateManager.clear(userId);
   },
 };
@@ -1017,7 +1160,7 @@ const CancelFlow = {
 
     if (Identity.isOrganizerStep(state)) {
       if (Identity.handleOrganizerStep(state, userId, replyToken, text)) {
-        this._showList(state, userId, replyToken, ss, st);
+        Identity.showList(state, userId, replyToken, ss, 'キャンセル');
       }
       return;
     }
@@ -1026,47 +1169,25 @@ const CancelFlow = {
       // 本人モード（動員する人OFF）：入力された名前＝予約した人
       case 'ASK_GUEST_NAME':
         state.data.organizerName = text;
-        this._showList(state, userId, replyToken, ss, st);
+        Identity.showList(state, userId, replyToken, ss, 'キャンセル');
         return;
 
       // 一覧を見て、番号または名前でキャンセルする予約を選ぶ
-      case 'ASK_TARGET': {
+      case 'PICK_RESERVATION': {
         if (text === 'やめる') {
           StateManager.clear(userId);
           LineApi.reply(replyToken, 'キャンセルを中止しました。');
           return;
         }
-        const mine = this._mine(ss, state.data.organizerName);
-        const key = Util.toHalfWidth(text).trim().replace(/^no\.?\s*/i, '');
-        let target = null;
-
-        if (/^\d+$/.test(key)) {
-          target = mine.find(r => String(r.id) === String(Number(key)));
-          if (!target) {
-            LineApi.reply(replyToken, `No.${key} は一覧にありません。一覧の番号または名前を入力してください。`, ['やめる']);
-            return;
-          }
-        } else {
-          const named = mine.filter(r => String(r.guest).trim() === text.trim());
-          if (named.length === 0) {
-            LineApi.reply(replyToken, `「${text}」は一覧にありません。一覧の番号または名前を入力してください。`, ['やめる']);
-            return;
-          }
-          if (named.length > 1) {
-            LineApi.reply(replyToken,
-              `「${text}」さんの予約が複数あります。番号で教えてください。\n` + named.map(r => this._line(ss, r)).join('\n'),
-              ['やめる']);
-            return;
-          }
-          target = named[0];
-        }
-
+        const picked = Identity.pick(state, replyToken, ss, text);
+        if (picked.done) return;
+        const target = picked.reservation;
         state.data.guestName = target.guest;
         state.data.rowIndex = target.rowIndex;
         state.step = 'CONFIRM';
         StateManager.set(userId, state);
         LineApi.reply(replyToken,
-          `No.${target.id} ${target.guest}さんの予約をキャンセルします。\n${this._describe(ss, st, target)}\nよろしいですか？`,
+          `No.${target.id} ${target.guest}さんの予約をキャンセルします。\n${Identity.describe(ss, st, target)}\nよろしいですか？`,
           ['キャンセルする', 'やめる']);
         return;
       }
@@ -1090,56 +1211,6 @@ const CancelFlow = {
       default:
         StateManager.clear(userId);
     }
-  },
-
-  // この人（動員する人。本人モードでは本人）が登録した予約。キャンセル済みは除く
-  _mine(ss, name) {
-    return SheetUtils.getReservations(ss)
-      .filter(r => String(r.organizer).trim() === String(name).trim() && r.status !== STATUS.CANCELED);
-  },
-
-  // 一覧の1行：「No.1　小野あかね　キャンセル」（枠があれば名前のあとに付ける）
-  _line(ss, r) {
-    const slotMap = {};
-    SheetUtils.getSlotList(ss).forEach(s => { slotMap[Number(s['枠番号'])] = SheetUtils.slotLabel(s); });
-    const slot = (r.slot === '' || r.slot === undefined) ? '' : (slotMap[Number(r.slot)] || '枠' + r.slot);
-    return ['No.' + r.id, r.guest, slot, r.status].filter(Boolean).join('　');
-  },
-
-  _showList(state, userId, replyToken, ss, st) {
-    const name = state.data.organizerName;
-    const mine = this._mine(ss, name);
-    if (mine.length === 0) {
-      StateManager.clear(userId);
-      LineApi.reply(replyToken, `「${name}」さんのキャンセルできる予約は見つかりませんでした。名前を確認してもう一度お試しください。`);
-      return;
-    }
-    state.step = 'ASK_TARGET';
-    StateManager.set(userId, state);
-    LineApi.reply(replyToken,
-      `「${name}」さんが予約したのは以下です。\n` + mine.map(r => this._line(ss, r)).join('\n') +
-      '\nキャンセルする番号または名前を入力してください。', ['やめる']);
-  },
-
-  // 登録されている内容を、設定タブでONの項目だけ表示する（時間枠OFFの開催では枠を出さない）
-  _describe(ss, st, r) {
-    const slotMap = {};
-    SheetUtils.getSlotList(ss).forEach(s => { slotMap[Number(s['枠番号'])] = SheetUtils.slotLabel(s); });
-    const lines = [];
-    const add = (key, value) => {
-      if (Settings.isOn(st, key) && value !== '' && value !== undefined && value !== null) {
-        lines.push(`・${st[key].label}：${value}`);
-      }
-    };
-    if (Settings.isOn(st, 'organizer') && String(r.organizer).trim() !== String(r.guest).trim()) add('organizer', r.organizer);
-    add('slot', (r.slot === '' || r.slot === undefined) ? '' : (slotMap[Number(r.slot)] || '枠' + r.slot));
-    add('age', r.age);
-    add('gender', r.gender);
-    add('staff', r.staff);
-    add('menu', r.menu);
-    if (Settings.isOn(st, 'note')) lines.push(`・${st.note.label}：${r.note || 'なし'}`);
-    lines.push(`・ステータス：${r.status === STATUS.PENDING ? '要確認（キャンセル待ち）' : r.status}`);
-    return lines.join('\n');
   },
 };
 
@@ -1193,6 +1264,91 @@ const Identity = {
 
   isOrganizerStep(state) {
     return state.step === 'CONFIRM_ORGANIZER_NAME' || state.step === 'ASK_ORGANIZER_NAME';
+  },
+
+  // ---------- 予約の一覧と選択（キャンセル・変更で共通）----------
+
+  // この人（動員する人。本人モードでは本人）が登録した予約。キャンセル済みは除く
+  mine(ss, name) {
+    return SheetUtils.getReservations(ss)
+      .filter(r => String(r.organizer).trim() === String(name).trim() && r.status !== STATUS.CANCELED);
+  },
+
+  // 一覧の1行：「No.1　小野あかね　受付」（枠があれば名前のあとに付ける）
+  line(ss, r) {
+    const slotMap = {};
+    SheetUtils.getSlotList(ss).forEach(s => { slotMap[Number(s['枠番号'])] = SheetUtils.slotLabel(s); });
+    const slot = (r.slot === '' || r.slot === undefined) ? '' : (slotMap[Number(r.slot)] || '枠' + r.slot);
+    return ['No.' + r.id, r.guest, slot, r.status].filter(Boolean).join('　');
+  },
+
+  // 予約の一覧を出して、番号または名前を聞く（verb：「キャンセル」「変更」）。step を PICK_RESERVATION にする
+  showList(state, userId, replyToken, ss, verb) {
+    const name = state.data.organizerName;
+    const list = this.mine(ss, name);
+    if (list.length === 0) {
+      StateManager.clear(userId);
+      LineApi.reply(replyToken, `「${name}」さんの${verb}できる予約は見つかりませんでした。名前を確認してもう一度お試しください。`);
+      return;
+    }
+    state.step = 'PICK_RESERVATION';
+    StateManager.set(userId, state);
+    LineApi.reply(replyToken,
+      `「${name}」さんが予約したのは以下です。\n` + list.map(r => this.line(ss, r)).join('\n') +
+      `\n${verb}する番号または名前を入力してください。`, ['やめる']);
+  },
+
+  // 番号または名前から予約を決める。決まれば { reservation }、決まらなければ返信済みで { done: true }
+  pick(state, replyToken, ss, text) {
+    const list = this.mine(ss, state.data.organizerName);
+    const key = Util.toHalfWidth(text).trim().replace(/^no\.?\s*/i, '');
+    let target = null;
+    if (/^\d+$/.test(key)) {
+      target = list.find(r => String(r.id) === String(Number(key)));
+      if (!target) {
+        LineApi.reply(replyToken, `No.${key} は一覧にありません。一覧の番号または名前を入力してください。`, ['やめる']);
+        return { done: true };
+      }
+    } else {
+      const named = list.filter(r => String(r.guest).trim() === text.trim());
+      if (named.length === 0) {
+        LineApi.reply(replyToken, `「${text}」は一覧にありません。一覧の番号または名前を入力してください。`, ['やめる']);
+        return { done: true };
+      }
+      if (named.length > 1) {
+        LineApi.reply(replyToken,
+          `「${text}」さんの予約が複数あります。番号で教えてください。\n` + named.map(r => this.line(ss, r)).join('\n'),
+          ['やめる']);
+        return { done: true };
+      }
+      target = named[0];
+    }
+    return { reservation: target };
+  },
+
+  // 登録されている内容を、設定タブでONの項目だけ文章にする（時間枠OFFの開催では枠を出さない）。
+  // changedKeys（項目キーの配列）を渡すと、その項目に「（変更）」を付ける
+  describe(ss, st, r, changedKeys) {
+    const changed = Array.isArray(changedKeys) ? changedKeys : (changedKeys ? [changedKeys] : []);
+    const slotMap = {};
+    SheetUtils.getSlotList(ss).forEach(s => { slotMap[Number(s['枠番号'])] = SheetUtils.slotLabel(s); });
+    const lines = [];
+    const add = (key, value) => {
+      if (Settings.isOn(st, key) && value !== '' && value !== undefined && value !== null) {
+        lines.push(`・${st[key].label}：${value}` + (changed.indexOf(key) !== -1 ? '（変更）' : ''));
+      }
+    };
+    if (Settings.isOn(st, 'organizer') && String(r.organizer).trim() !== String(r.guest).trim()) add('organizer', r.organizer);
+    add('slot', (r.slot === '' || r.slot === undefined) ? '' : (slotMap[Number(r.slot)] || '枠' + r.slot));
+    add('age', r.age);
+    add('gender', r.gender);
+    add('staff', r.staff);
+    add('menu', r.menu);
+    if (Settings.isOn(st, 'note')) {
+      lines.push(`・${st.note.label}：${r.note || 'なし'}` + (changed.indexOf('note') !== -1 ? '（変更）' : ''));
+    }
+    lines.push(`・ステータス：${r.status === STATUS.PENDING ? '要確認（キャンセル待ち）' : r.status}`);
+    return lines.join('\n');
   },
 };
 
