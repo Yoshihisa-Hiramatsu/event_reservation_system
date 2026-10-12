@@ -1,4 +1,4 @@
-// ===== Config.gs =====
+/// ===== Config.gs =====
 // 実際の値はスクリプトエディタの「プロジェクトの設定」→「スクリプト プロパティ」で設定してください。
 //   CONTROL_SHEET_ID          : 親（コントロール）シートのスプレッドシートID
 //   LINE_CHANNEL_ACCESS_TOKEN : LINE Developersで発行したチャネルアクセストークン
@@ -51,6 +51,10 @@ const DEFAULT_SETTINGS = {
   // 当日スケジュールの見出しなどに使う「対応する人」の呼び方
   staff_role: { label: '対応者', enabled: true, choices: [] },
   msg_accepted: { label: '受付完了メッセージ', text: '受け付けました（予約No.{no}）。', enabled: true, choices: [] },
+  // 満席だと分かった時点で（質問の前に）伝える文。このあと「キャンセル待ち（要確認）」として登録を続ける
+  msg_full: { label: '満席メッセージ',
+    text: '申し訳ありません。ご希望いただける枠は満席です。キャンセル待ち（要確認）として登録を続けます。',
+    enabled: true, choices: [] },
   msg_pending: { label: '要確認メッセージ',
     text: '現在満枠のため「要確認」として登録しました（予約No.{no}）。主催者確認後、あらためてご連絡します。',
     enabled: true, choices: [] },
@@ -505,7 +509,14 @@ const RegisterFlow = {
       eventName: event.name,
       data: {},
     };
-    const head = `「${event.name}」のご登録ですね。\n`;
+    let head = `「${event.name}」のご登録ですね。\n`;
+
+    // 時間枠を使わない開催で、すでに全体の定員に達している場合は、最初に満席をお伝えして
+    // キャンセル待ち（要確認）として登録を続ける
+    if (!Settings.isOn(st, 'slot') && SheetUtils.isEventFull(ss)) {
+      state.data.waitlist = true;
+      head += st.msg_full.text + '\n\n';
+    }
 
     // 「動員する人」をOFFにしている開催（個別相談会など）は、ゲスト名から聞き始める
     if (!Settings.isOn(st, 'organizer')) {
@@ -559,10 +570,19 @@ const RegisterFlow = {
         return;
 
       case 'ASK_SLOT': {
-        const slots = SheetUtils.getSlotList(ss);
-        const slot = slots.find(s => SheetUtils.slotLabel(s) === text);
+        // 満席になった枠は選べない（選んでいる間に埋まった場合も、ここで弾く）
+        const available = SheetUtils.getAvailableSlots(ss);
+        const slot = available.find(s => SheetUtils.slotLabel(s) === text);
         if (!slot) {
-          LineApi.reply(replyToken, '選択肢の中から選んでください。', slots.map(s => SheetUtils.slotLabel(s)));
+          if (available.length === 0) {
+            // 迷っている間に全部埋まった → キャンセル待ち（要確認）として続ける
+            d.waitlist = true;
+            d.slotNumber = '';
+            d.slotText = '';
+            this._next(state, userId, replyToken, ss, st, 'slot', st.msg_full.text + '\n\n');
+            return;
+          }
+          LineApi.reply(replyToken, '選択肢の中から選んでください。', available.map(s => SheetUtils.slotLabel(s)));
           return;
         }
         d.slotNumber = slot['枠番号'];
@@ -625,7 +645,10 @@ const RegisterFlow = {
     for (; i < REGISTER_ORDER.length; i++) {
       const key = REGISTER_ORDER[i];
       if (!Settings.isOn(st, key)) continue;
-      if (this._ask(state, userId, replyToken, ss, st, key, prefix)) return;
+      const asked = this._ask(state, userId, replyToken, ss, st, key, prefix);
+      if (asked === true) return;
+      // 満席のお知らせは、次の質問の前に付けて1通で送る
+      if (asked && asked.notice) prefix += asked.notice + '\n\n';
     }
     state.step = 'CONFIRM';
     StateManager.set(userId, state);
@@ -650,9 +673,17 @@ const RegisterFlow = {
           LineApi.reply(replyToken, '現在選べる時間枠がありません。主催者にご確認ください。');
           return true;
         }
+        // 満席の枠は選択肢に出さない。全部満席なら、満席をお知らせしてキャンセル待ちとして続ける
+        const available = SheetUtils.getAvailableSlots(ss);
+        if (available.length === 0) {
+          state.data.waitlist = true;
+          state.data.slotNumber = '';
+          state.data.slotText = '';
+          return { notice: st.msg_full.text };
+        }
         state.step = 'ASK_SLOT';
         StateManager.set(userId, state);
-        LineApi.reply(replyToken, question, slots.map(s => SheetUtils.slotLabel(s)));
+        LineApi.reply(replyToken, question, available.map(s => SheetUtils.slotLabel(s)));
         return true;
       }
 
@@ -727,11 +758,13 @@ const RegisterFlow = {
     if (d.staff !== undefined) lines.push(`${st.staff.label}：${d.staff}`);
     if (d.treatments) lines.push(`${st.menu.label}：${d.treatments.join('、')}`);
     if (Settings.isOn(st, 'note')) lines.push(`${st.note.label}：${d.note || 'なし'}`);
+    if (d.waitlist) lines.push('※満席のため、キャンセル待ち（要確認）としての登録になります。');
     return lines.join('\n');
   },
 
   _save(state, userId, replyToken, ss, st) {
     const d = state.data;
+    d.slotOff = !Settings.isOn(st, 'slot');
     const result = SheetUtils.appendReservation(ss, d);
     StateManager.clear(userId);
 
@@ -947,7 +980,7 @@ const ConfirmFlow = {
     // 時間枠を使わない開催では枠の表示を省く
     const lines = reservations.map(r => {
       const slotText = (r.slot === '' || r.slot === undefined) ? '' : (slotMap[Number(r.slot)] || '枠' + r.slot);
-      return '・' + [`${r.guest}様`, slotText, `ステータス:${r.status}`].filter(Boolean).join('／');
+      return '・' + [`${r.guest}様`, slotText, `ステータス:${r.status === STATUS.PENDING ? '要確認（キャンセル待ち）' : r.status}`].filter(Boolean).join('／');
     });
     LineApi.reply(replyToken, `「${state.eventName}」の${name}さんの予約一覧です。\n` + lines.join('\n'));
   },
@@ -1008,7 +1041,10 @@ const CancelFlow = {
           LineApi.reply(replyToken, 'キャンセルしました。');
           const who = (state.data.organizerName !== state.data.guestName)
             ? `${state.data.organizerName}さんが${state.data.guestName}さんの予約を` : `${state.data.guestName}さんが予約を`;
-          SheetUtils.notifyOrganizers(`【キャンセル】[${state.eventName}] ${who}キャンセルしました。`);
+          // 要確認（キャンセル待ち）の人がいるときは、空きが出た可能性を主催者に知らせる
+          const waiting = SheetUtils.getReservations(ss).filter(r => r.status === STATUS.PENDING).length;
+          SheetUtils.notifyOrganizers(`【キャンセル】[${state.eventName}] ${who}キャンセルしました。` +
+            (waiting > 0 ? `\n※要確認（キャンセル待ち）の予約が${waiting}件あります。` : ''));
         } else {
           LineApi.reply(replyToken, 'キャンセルを中止しました。');
         }
@@ -1238,6 +1274,45 @@ const SheetUtils = {
     return result;
   },
 
+  // 枠の受付可能人数。空欄・数字以外は「制限なし」として扱う
+  _capacityOf(slot) {
+    const raw = Util.toHalfWidth(slot['受付可能人数']).trim();
+    if (raw === '') return Infinity;
+    const n = Number(raw);
+    return isNaN(n) ? Infinity : n;
+  },
+
+  // 枠ごとの空き状況。使った人数には「要確認（キャンセル待ち）」も含める
+  // （キャンセルが出ても、待っている人より先に新しい人が入らないようにするため）
+  getSlotAvailability(ss) {
+    const counts = {};
+    this.getReservations(ss)
+      .filter(r => r.status !== STATUS.CANCELED && r.slot !== '' && r.slot !== undefined)
+      .forEach(r => { counts[Number(r.slot)] = (counts[Number(r.slot)] || 0) + 1; });
+    return this.getSlotList(ss).map(s => {
+      const capacity = this._capacityOf(s);
+      const used = counts[Number(s['枠番号'])] || 0;
+      return { slot: s, capacity: capacity, used: used, remaining: capacity - used };
+    });
+  },
+
+  // まだ空きがある枠だけ
+  getAvailableSlots(ss) {
+    return this.getSlotAvailability(ss).filter(a => a.remaining > 0).map(a => a.slot);
+  },
+
+  // 時間枠を使わない開催：枠マスタの「受付可能人数」の合計をイベント全体の定員とみなす。
+  // 枠マスタが空、または受付可能人数が空欄の行があれば「制限なし」
+  isEventFull(ss) {
+    const slots = this.getSlotList(ss);
+    if (slots.length === 0) return false;
+    const capacities = slots.map(s => this._capacityOf(s));
+    if (capacities.some(c => c === Infinity)) return false;
+    const total = capacities.reduce((a, b) => a + b, 0);
+    const used = this.getReservations(ss).filter(r => r.status !== STATUS.CANCELED).length;
+    return used >= total;
+  },
+
   // 指定した枠番号の現在の受付件数（キャンセルを除く）
   countReservationsInSlot(ss, slotNumber) {
     return this.getReservations(ss)
@@ -1264,15 +1339,25 @@ const SheetUtils = {
     const blankIndex = idValues.findIndex(v => v === '' || v === null || v === undefined);
     const targetRow = (blankIndex === -1) ? lastRow + 1 : blankIndex + 2; // +2はA2始まりのオフセット
 
-    // 時間枠を使わない開催（slot=OFF）では、枠の定員チェックはせず常に「受付」にする
-    const hasSlot = data.slotNumber !== undefined && data.slotNumber !== '' && data.slotNumber !== null;
+    // 受付か要確認（キャンセル待ち）かを決める
+    //   ・data.waitlist        : 満席と分かっている（空いている枠がない）→ 要確認
+    //   ・data.slotOff         : 時間枠を使わない開催 → イベント全体の定員で判定
+    //   ・それ以外             : 選んだ枠の定員で判定（登録の瞬間にもう一度確認する）
+    const hasSlot = !data.slotOff && !data.waitlist &&
+      data.slotNumber !== undefined && data.slotNumber !== '' && data.slotNumber !== null;
     let status = STATUS.ACCEPTED;
-    if (hasSlot) {
-      const slots = this.getSlotList(ss);
-      const slot = slots.find(s => Number(s['枠番号']) === Number(data.slotNumber));
-      const capacity = slot ? Number(slot['受付可能人数']) : 0;
-      const currentCount = this.countReservationsInSlot(ss, data.slotNumber);
-      status = (currentCount + 1) > capacity ? STATUS.PENDING : STATUS.ACCEPTED;
+    if (data.waitlist) {
+      status = STATUS.PENDING;
+    } else if (data.slotOff) {
+      if (this.isEventFull(ss)) status = STATUS.PENDING;
+    } else {
+      const slot = this.getSlotList(ss).find(s => Number(s['枠番号']) === Number(data.slotNumber));
+      if (!slot) {
+        status = STATUS.PENDING;
+      } else {
+        const currentCount = this.countReservationsInSlot(ss, data.slotNumber);
+        status = (currentCount + 1) > this._capacityOf(slot) ? STATUS.PENDING : STATUS.ACCEPTED;
+      }
     }
 
     sheet.getRange(targetRow, 1, 1, RES_DATA_COLS).setValues([[
@@ -1448,7 +1533,7 @@ const SheetUtils = {
 
     const rows = this.getReservations(ss)
       .filter(r => r.status === STATUS.PENDING)
-      .map(r => [r.id, slotMap[Number(r.slot)] || r.slot, r.organizer, r.guest, r.staff, r.createdAt, r.memo]);
+      .map(r => [r.id, slotMap[Number(r.slot)] || r.slot || '（枠なし）', r.organizer, r.guest, r.staff, r.createdAt, r.memo]);
     if (rows.length > 0) {
       sheet.getRange(2, 1, rows.length, header.length).setValues(rows);
     }
