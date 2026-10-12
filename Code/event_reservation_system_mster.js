@@ -1010,27 +1010,56 @@ const CancelFlow = {
 
     if (Identity.isOrganizerStep(state)) {
       if (Identity.handleOrganizerStep(state, userId, replyToken, text)) {
-        state.step = 'ASK_GUEST_NAME';
-        StateManager.set(userId, state);
-        LineApi.reply(replyToken, `キャンセルする「${st.guest.label}」を教えてください。`);
+        this._showList(state, userId, replyToken, ss, st);
       }
       return;
     }
 
     switch (state.step) {
-      case 'ASK_GUEST_NAME': {
-        if (state.data.selfMode) state.data.organizerName = text;
-        const matches = SheetUtils.findReservation(ss, state.data.organizerName, text);
-        if (matches.length === 0) {
-          LineApi.reply(replyToken, '該当する予約が見つかりませんでした。名前を確認してもう一度お試しください。');
+      // 本人モード（動員する人OFF）：入力された名前＝予約した人
+      case 'ASK_GUEST_NAME':
+        state.data.organizerName = text;
+        this._showList(state, userId, replyToken, ss, st);
+        return;
+
+      // 一覧を見て、番号または名前でキャンセルする予約を選ぶ
+      case 'ASK_TARGET': {
+        if (text === 'やめる') {
           StateManager.clear(userId);
+          LineApi.reply(replyToken, 'キャンセルを中止しました。');
           return;
         }
-        state.data.guestName = text;
-        state.data.rowIndex = matches[0].rowIndex; // 動員する人+ゲスト名で一意に決まる前提
+        const mine = this._mine(ss, state.data.organizerName);
+        const key = Util.toHalfWidth(text).trim().replace(/^no\.?\s*/i, '');
+        let target = null;
+
+        if (/^\d+$/.test(key)) {
+          target = mine.find(r => String(r.id) === String(Number(key)));
+          if (!target) {
+            LineApi.reply(replyToken, `No.${key} は一覧にありません。一覧の番号または名前を入力してください。`, ['やめる']);
+            return;
+          }
+        } else {
+          const named = mine.filter(r => String(r.guest).trim() === text.trim());
+          if (named.length === 0) {
+            LineApi.reply(replyToken, `「${text}」は一覧にありません。一覧の番号または名前を入力してください。`, ['やめる']);
+            return;
+          }
+          if (named.length > 1) {
+            LineApi.reply(replyToken,
+              `「${text}」さんの予約が複数あります。番号で教えてください。\n` + named.map(r => this._line(ss, r)).join('\n'),
+              ['やめる']);
+            return;
+          }
+          target = named[0];
+        }
+
+        state.data.guestName = target.guest;
+        state.data.rowIndex = target.rowIndex;
         state.step = 'CONFIRM';
         StateManager.set(userId, state);
-        LineApi.reply(replyToken, `${text}さんの予約をキャンセルします。よろしいですか？`,
+        LineApi.reply(replyToken,
+          `No.${target.id} ${target.guest}さんの予約をキャンセルします。\n${this._describe(ss, st, target)}\nよろしいですか？`,
           ['キャンセルする', 'やめる']);
         return;
       }
@@ -1054,6 +1083,56 @@ const CancelFlow = {
       default:
         StateManager.clear(userId);
     }
+  },
+
+  // この人（動員する人。本人モードでは本人）が登録した予約。キャンセル済みは除く
+  _mine(ss, name) {
+    return SheetUtils.getReservations(ss)
+      .filter(r => String(r.organizer).trim() === String(name).trim() && r.status !== STATUS.CANCELED);
+  },
+
+  // 一覧の1行：「No.1　小野あかね　キャンセル」（枠があれば名前のあとに付ける）
+  _line(ss, r) {
+    const slotMap = {};
+    SheetUtils.getSlotList(ss).forEach(s => { slotMap[Number(s['枠番号'])] = SheetUtils.slotLabel(s); });
+    const slot = (r.slot === '' || r.slot === undefined) ? '' : (slotMap[Number(r.slot)] || '枠' + r.slot);
+    return ['No.' + r.id, r.guest, slot, r.status].filter(Boolean).join('　');
+  },
+
+  _showList(state, userId, replyToken, ss, st) {
+    const name = state.data.organizerName;
+    const mine = this._mine(ss, name);
+    if (mine.length === 0) {
+      StateManager.clear(userId);
+      LineApi.reply(replyToken, `「${name}」さんのキャンセルできる予約は見つかりませんでした。名前を確認してもう一度お試しください。`);
+      return;
+    }
+    state.step = 'ASK_TARGET';
+    StateManager.set(userId, state);
+    LineApi.reply(replyToken,
+      `「${name}」さんが予約したのは以下です。\n` + mine.map(r => this._line(ss, r)).join('\n') +
+      '\nキャンセルする番号または名前を入力してください。', ['やめる']);
+  },
+
+  // 登録されている内容を、設定タブでONの項目だけ表示する（時間枠OFFの開催では枠を出さない）
+  _describe(ss, st, r) {
+    const slotMap = {};
+    SheetUtils.getSlotList(ss).forEach(s => { slotMap[Number(s['枠番号'])] = SheetUtils.slotLabel(s); });
+    const lines = [];
+    const add = (key, value) => {
+      if (Settings.isOn(st, key) && value !== '' && value !== undefined && value !== null) {
+        lines.push(`・${st[key].label}：${value}`);
+      }
+    };
+    if (Settings.isOn(st, 'organizer') && String(r.organizer).trim() !== String(r.guest).trim()) add('organizer', r.organizer);
+    add('slot', (r.slot === '' || r.slot === undefined) ? '' : (slotMap[Number(r.slot)] || '枠' + r.slot));
+    add('age', r.age);
+    add('gender', r.gender);
+    add('staff', r.staff);
+    add('menu', r.menu);
+    if (Settings.isOn(st, 'note')) lines.push(`・${st.note.label}：${r.note || 'なし'}`);
+    lines.push(`・ステータス：${r.status === STATUS.PENDING ? '要確認（キャンセル待ち）' : r.status}`);
+    return lines.join('\n');
   },
 };
 
@@ -1395,7 +1474,7 @@ const SheetUtils = {
       .filter(r => String(r.organizer).trim() === String(organizerName).trim() &&
                    String(r.guest).trim() === String(guestName).trim() &&
                    r.status !== STATUS.CANCELED)
-      .map(r => ({ rowIndex: r.rowIndex, status: r.status }));
+      ; // 予約の全項目（rowIndex・status を含む）をそのまま返す
   },
 
   updateReservationStatus(ss, rowIndex, status) {
