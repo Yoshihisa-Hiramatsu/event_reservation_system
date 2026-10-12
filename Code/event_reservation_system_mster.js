@@ -602,7 +602,7 @@ const RegisterFlow = {
         return;
 
       case 'ASK_STAFF': {
-        const options = [...SheetUtils.getStaffList(ss), ...st.staff.choices];
+        const options = [...SheetUtils.getStaffForSlot(ss, d.slotNumber), ...st.staff.choices];
         if (!options.includes(text)) {
           LineApi.reply(replyToken, '選択肢の中から選んでください。', options);
           return;
@@ -695,7 +695,8 @@ const RegisterFlow = {
         return true;
 
       case 'staff': {
-        const staffList = SheetUtils.getStaffList(ss);
+        // 選んだ枠で対応できる人だけを出す（誰も対応できない枠では、この質問は飛ばす）
+        const staffList = SheetUtils.getStaffForSlot(ss, state.data.slotNumber);
         if (staffList.length === 0) return false;
         state.step = 'ASK_STAFF';
         StateManager.set(userId, state);
@@ -844,7 +845,7 @@ const ChangeFlow = {
       case 'INPUT_NEW_VALUE': {
         const key = state.data.target;
         if (key === 'staff') {
-          const options = [...SheetUtils.getStaffList(ss), ...st.staff.choices];
+          const options = [...this._staffOptions(ss, st, state.data.rowIndex)];
           if (!options.includes(text)) {
             LineApi.reply(replyToken, '選択肢の中から選んでください。', options);
             return;
@@ -878,6 +879,12 @@ const ChangeFlow = {
   },
 
   // 設定でONになっていて、変更の対象にできる項目
+  // 変更対象の予約の枠で対応できる人（枠が無い予約は全員）＋「誰でも良い」など
+  _staffOptions(ss, st, rowIndex) {
+    const r = SheetUtils.getReservations(ss).find(x => x.rowIndex === rowIndex);
+    return [...SheetUtils.getStaffForSlot(ss, r ? r.slot : ''), ...st.staff.choices];
+  },
+
   _targets(st) {
     return CHANGEABLE_KEYS.filter(k => Settings.isOn(st, k));
   },
@@ -890,7 +897,7 @@ const ChangeFlow = {
       state.step = 'INPUT_NEW_VALUE';
       StateManager.set(userId, state);
       LineApi.reply(replyToken, `新しい「${label}」を選んでください。`,
-        [...SheetUtils.getStaffList(ss), ...st.staff.choices]);
+        this._staffOptions(ss, st, state.data.rowIndex));
     } else if (key === 'menu') {
       const menu = SheetUtils.getMenuList(ss);
       state.data.treatments = [];
@@ -1315,6 +1322,35 @@ const SheetUtils = {
   // 対応者一覧：A列（1列目）の2行目以降。見出しの文字は自由に変えてよい
   getStaffList(ss) {
     return this._firstColumn(ss.getSheetByName(SHEET_NAMES.STAFF_LIST));
+  },
+
+  // 選んだ枠で対応できる人だけを返す。
+  //   対応者一覧のB列（対応可能時間帯）に、枠マスタの「枠名」をカンマ（, 、 ，）区切りで書くと、その枠でだけ選べる。
+  //   ・B列が空欄の人／B列に枠名が1つも書かれていない人（「昼のみ」などのメモ）は、どの枠でも選べる
+  //   ・slotNumber が空（時間枠を使わない・キャンセル待ち）なら全員を返す
+  getStaffForSlot(ss, slotNumber) {
+    const all = this.getStaffList(ss);
+    if (slotNumber === '' || slotNumber === undefined || slotNumber === null) return all;
+    const slots = this.getSlotList(ss);
+    const chosen = slots.find(s => Number(s['枠番号']) === Number(slotNumber));
+    if (!chosen) return all;
+    const norm = v => Util.toHalfWidth(String(v)).trim();
+    const slotNames = slots.map(s => norm(s['枠名']));
+    const sheet = ss.getSheetByName(SHEET_NAMES.STAFF_LIST);
+    const lastRow = sheet.getLastRow();
+    if (lastRow < 2) return [];
+    const width = Math.min(2, sheet.getMaxColumns());
+    const rows = sheet.getRange(2, 1, lastRow - 1, width).getDisplayValues()
+      .map(r => [r[0], width > 1 ? r[1] : '']);
+    return rows
+      .filter(r => String(r[0]).trim() !== '')
+      .filter(r => {
+        const tokens = String(r[1]).split(/[,、，\n]/).map(norm).filter(t => t !== '');
+        const known = tokens.filter(t => slotNames.indexOf(t) !== -1);
+        if (known.length === 0) return true; // 制限なし
+        return known.indexOf(norm(chosen['枠名'])) !== -1;
+      })
+      .map(r => String(r[0]).trim());
   },
 
   // メニュー：A列（1列目）の2行目以降。「メニュー」タブ、なければ旧「施術メニュー」タブを使う
