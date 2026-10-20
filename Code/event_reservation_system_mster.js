@@ -284,6 +284,13 @@ function menu_createEvent() {
     return;
   }
 
+  // 日付と開催名が決まった時点で、同じ開催IDがないかを確かめる（ひな形を選ぶ前に止める）
+  const newId = EventAdmin.makeEventId(parsed, name);
+  if (EventAdmin.eventIdExists(newId)) {
+    ui.alert(`開催ID「${newId}」はすでに開催マスタにあります。\n開催日か開催名を変えて、最初からやり直してください。`);
+    return;
+  }
+
   let template = templates[0];
   if (templates.length > 1) {
     const list = templates.map((t, i) => `${i + 1}. ${t.name}`).join('\n');
@@ -570,6 +577,11 @@ const RegisterFlow = {
     }
   },
 
+  // 年齢・性別：選択肢が設定されているときは、その中から選ばせる（選択肢が空なら自由入力）
+  _validChoice(st, key, text) {
+    return st[key].choices.length === 0 || st[key].choices.indexOf(text) !== -1;
+  },
+
   // 選択肢の末尾に「やめる」を付ける（クイックリプライは13個まで）
   _withQuit(list) {
     return list.slice(0, MAX_QUICK_REPLIES - 1).concat(REGISTER_QUIT);
@@ -665,11 +677,19 @@ const RegisterFlow = {
       }
 
       case 'ASK_AGE':
+        if (!this._validChoice(st, 'age', text)) {
+          LineApi.reply(replyToken, '選択肢の中から選んでください。', this._withQuit(st.age.choices));
+          return;
+        }
         d.age = text;
         this._next(state, userId, replyToken, ss, st, 'age', '');
         return;
 
       case 'ASK_GENDER':
+        if (!this._validChoice(st, 'gender', text)) {
+          LineApi.reply(replyToken, '選択肢の中から選んでください。', this._withQuit(st.gender.choices));
+          return;
+        }
         d.gender = text;
         this._next(state, userId, replyToken, ss, st, 'gender', '');
         return;
@@ -1027,6 +1047,10 @@ const ChangeFlow = {
             LineApi.reply(replyToken, '選択肢の中から選んでください。', options);
             return;
           }
+        }
+        if ((key === 'age' || key === 'gender') && !RegisterFlow._validChoice(st, key, text)) {
+          LineApi.reply(replyToken, '選択肢の中から選んでください。', st[key].choices);
+          return;
         }
         const none = st.note.choices[0] || '特になし';
         state.data.updates[key] = (key === 'note' && text === none) ? '' : text;
@@ -2035,15 +2059,26 @@ const EventAdmin = {
       .map(r => ({ name: r[0], url: r[1] }));
   },
 
+  // 開催ID（開催年月日_開催名）の組み立て
+  makeEventId(parsedDate, name) {
+    return `${parsedDate.yyyymmdd}_${name}`;
+  },
+
+  // その開催IDが、すでに開催マスタにあるか（予約シートURLが空の行も含めて調べる）
+  eventIdExists(eventId) {
+    const master = SheetUtils.getControlSheet().getSheetByName(SHEET_NAMES.EVENT_MASTER);
+    const idColumn = master.getRange(1, 1, master.getMaxRows(), 1).getValues().flat();
+    return SheetUtils.getAllEvents().some(e => e.eventId === eventId) || idColumn.indexOf(eventId) !== -1;
+  },
+
   // ひな形を複製して「開催年月日_開催名」のファイルを作り、開催マスタに追記する
   createEvent(parsedDate, name, template) {
-    const eventId = `${parsedDate.yyyymmdd}_${name}`;
+    const eventId = this.makeEventId(parsedDate, name);
     const control = SheetUtils.getControlSheet();
     const master = control.getSheetByName(SHEET_NAMES.EVENT_MASTER);
 
-    const existing = SheetUtils.getAllEvents().some(e => e.eventId === eventId);
     const idColumn = master.getRange(1, 1, master.getMaxRows(), 1).getValues().flat();
-    if (existing || idColumn.indexOf(eventId) !== -1) {
+    if (this.eventIdExists(eventId)) {
       throw new Error(`開催ID「${eventId}」はすでに開催マスタにあります。`);
     }
 
