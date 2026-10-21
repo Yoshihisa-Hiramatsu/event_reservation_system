@@ -335,6 +335,13 @@ function menu_buildDaySchedule() {
       ? `同じ対応者に複数ゲストが割り当てられているセルが ${duplicateCount} 件あります（オレンジ色のセル）。`
       : '当日スケジュールに重複はありません。');
   }
+  // 担当者が対応できない枠に入っている予約があれば、一覧で知らせる
+  const unavailable = SheetUtils.getUnavailableAssignments(ss);
+  if (unavailable.length > 0) {
+    lines.push('', '⚠担当者が対応できない枠に、スケジュールされています。（赤色のセル）');
+    unavailable.forEach(u => lines.push(`・（${u.staff}→${u.slotLabel}）${u.guest}さん`));
+    lines.push('', '予約タブの「確定担当者」「確定枠番号」を見直してください。', '');
+  }
   lines.push(`要確認の予約：${pendingCount} 件`);
   ui.alert(lines.join('\n'));
 }
@@ -538,7 +545,8 @@ const RegisterFlow = {
         return;
       }
       state.step = 'CONFIRM_WAITLIST';
-      state.data.waitlist = true;
+      // 時間枠がある開催は、満席でも枠を選んでもらう（枠つきの要確認）。枠がない開催は枠なしの要確認
+      state.data.waitlist = !Settings.isOn(st, 'slot');
       state.data.waitlistAck = true;
       StateManager.set(userId, state);
       let ask = st.msg_full.text;
@@ -652,18 +660,10 @@ const RegisterFlow = {
         const pool = allowFull ? SheetUtils.getSlotList(ss) : available;
         const slot = pool.find(s => SheetUtils.slotLabel(s) === text);
         if (!slot) {
-          if (available.length === 0) {
-            if (!allowFull) {
-              StateManager.clear(userId);
-              LineApi.reply(replyToken, st.msg_closed.text);
-              return;
-            }
-            // 迷っている間に全部埋まった → キャンセル待ち（要確認）として続ける
-            d.waitlist = true;
-            d.slotNumber = '';
-            d.slotText = '';
-            this._next(state, userId, replyToken, ss, st, 'slot',
-              '申し訳ありません。お選びいただく間に満席になりました。キャンセル待ち（要確認）として登録を続けます。\n\n');
+          if (!allowFull && available.length === 0) {
+            // 迷っている間に全部埋まった → 受け付けない設定なので、ここで終わる
+            StateManager.clear(userId);
+            LineApi.reply(replyToken, st.msg_closed.text);
             return;
           }
           LineApi.reply(replyToken, '選択肢の中から選んでください。', this._slotChoices(ss, st));
@@ -768,28 +768,22 @@ const RegisterFlow = {
         }
         const available = SheetUtils.getAvailableSlots(ss);
         const allowFull = Settings.isOn(st, 'waitlist');
-        // 登録を始めたあとに空きが出た場合は、通常どおり枠を選んでもらう
-        if (state.data.waitlistAck && available.length > 0) state.data.waitlist = false;
-        if (available.length === 0) {
-          // 全部満席。「満席でも受け付ける」がOFFなら受付終了、ONならキャンセル待ち（要確認）として続ける
-          if (!allowFull) {
-            StateManager.clear(userId);
-            LineApi.reply(replyToken, st.msg_closed.text);
-            return true;
-          }
-          state.data.waitlist = true;
-          state.data.slotNumber = '';
-          state.data.slotText = '';
-          // 登録を始める前に「進める」と答えている場合は、もう一度お知らせしない
-          return { notice: state.data.waitlistAck ? '' :
-            '申し訳ありません。ご希望いただける枠は満席です。キャンセル待ち（要確認）として登録を続けます。' };
+        // すべて満席で、満席でも受け付けない設定なら、ここで受付終了
+        if (available.length === 0 && !allowFull) {
+          StateManager.clear(userId);
+          LineApi.reply(replyToken, st.msg_closed.text);
+          return true;
         }
         // 満席の枠も選べるときは、その枠がキャンセル待ちになることを質問の下に添える
         let note = '';
         if (allowFull) {
-          const fullNames = SheetUtils.getSlotAvailability(ss).filter(a => a.remaining <= 0)
-            .map(a => `「${SheetUtils.slotLabel(a.slot)}」`);
-          if (fullNames.length > 0) note = `\n※${fullNames.join('')}はキャンセル待ち（要確認）での受付になります。`;
+          if (available.length === 0) {
+            note = '\n※すべての枠がキャンセル待ち（要確認）での受付になります。';
+          } else {
+            const fullNames = SheetUtils.getSlotAvailability(ss).filter(a => a.remaining <= 0)
+              .map(a => `「${SheetUtils.slotLabel(a.slot)}」`);
+            if (fullNames.length > 0) note = `\n※${fullNames.join('')}はキャンセル待ち（要確認）での受付になります。`;
+          }
         }
         state.step = 'ASK_SLOT';
         StateManager.set(userId, state);
@@ -1863,6 +1857,33 @@ const SheetUtils = {
 
   // ---------- 当日スケジュール・要確認リスト ----------
 
+  // 「確定担当者」が、確定した枠に対応できない予約を返す（時間枠を使わない開催は空）。
+  // 対応できるかどうかは、登録時の「枠ごとの対応者」（対応者一覧のB列）と同じルールで判定する。
+  // 戻り値：[{ guest, staff, slotNumber, slotLabel }]
+  getUnavailableAssignments(ss) {
+    if (!Settings.isOn(Settings.load(ss), 'slot')) return [];
+    const staffList = this.getStaffList(ss);
+    const slots = this.getSlotList(ss);
+    const eligibleCache = {};
+    const result = [];
+    this.getReservations(ss)
+      .filter(r => r.status !== STATUS.CANCELED && r.confirmedStaff)
+      .forEach(r => {
+        const slotNumber = (r.confirmedSlot !== '' && r.confirmedSlot !== undefined) ? r.confirmedSlot : r.slot;
+        if (slotNumber === '' || slotNumber === undefined || slotNumber === null) return;
+        const slot = slots.find(x => Number(x['枠番号']) === Number(slotNumber));
+        if (!slot) return;
+        const staff = String(r.confirmedStaff).trim();
+        if (staffList.indexOf(staff) === -1) return; // 対応者一覧にない名前は、この判定の対象外
+        const k = String(slotNumber);
+        if (!eligibleCache[k]) eligibleCache[k] = this.getStaffForSlot(ss, slotNumber);
+        if (eligibleCache[k].indexOf(staff) === -1) {
+          result.push({ guest: r.guest, staff: staff, slotNumber: Number(slotNumber), slotLabel: this.slotLabel(slot) });
+        }
+      });
+    return result;
+  },
+
   // 当日スケジュール（行=枠、列=対応者）を対応者一覧・枠マスタ・予約タブから作り直す。
   // 「確定担当者」が入っている予約だけを反映する。同じ枠・同じ対応者に2人以上いる
   // セルはオレンジ色で目立たせる。戻り値は重複セルの件数。
@@ -1917,6 +1938,10 @@ const SheetUtils = {
       cellMap[key].push(lines.join('\n'));
     });
 
+    // 対応できない枠に入っているセルの目印（枠番号|担当者名）
+    const unavailable = {};
+    this.getUnavailableAssignments(ss).forEach(u => { unavailable[u.slotNumber + '|' + u.staff] = true; });
+
     let duplicateCount = 0;
     slots.forEach((slot, rowOffset) => {
       staffList.forEach((staff, colOffset) => {
@@ -1924,10 +1949,14 @@ const SheetUtils = {
         if (!entries) return;
         const cell = sheet.getRange(2 + rowOffset, 2 + colOffset);
         // 1件＝最大3行（ゲスト名／動員する人／メニュー）。複数件ある場合は空行で区切って積む
-        cell.setValue(entries.join('\n\n')).setWrap(true).setVerticalAlignment('top');
-        if (entries.length > 1) {
+        const bad = unavailable[Number(slot['枠番号']) + '|' + staff];
+        const text = (bad ? '⚠この枠は対応できません\n' : '') + entries.join('\n\n');
+        cell.setValue(text).setWrap(true).setVerticalAlignment('top');
+        if (entries.length > 1) duplicateCount++;
+        if (bad) {
+          cell.setBackground('#F4C7C3'); // 対応できない枠に入っている＝赤系（重複のオレンジより優先）
+        } else if (entries.length > 1) {
           cell.setBackground('#FDECC8'); // 1人が複数ゲストを担当＝重複を目立たせる
-          duplicateCount++;
         }
       });
     });
