@@ -103,23 +103,32 @@ const ChangeFlow = {
       // 新しい時間枠（空きのある枠だけ。いまの枠は除く）
       case 'INPUT_NEW_SLOT': {
         const current = this._current(ss, state);
-        const slot = this._availableSlots(ss, current).find(s => SheetUtils.slotLabel(s) === text);
+        const avail = this._availableSlots(ss, current);
+        const slot = avail.find(s => SheetUtils.slotLabel(s) === text);
         if (!slot) {
-          LineApi.reply(replyToken, '選択肢の中から選んでください。',
-            this._availableSlots(ss, current).map(s => SheetUtils.slotLabel(s)));
+          if (avail.length === 0) {
+            // 選んでいる間に空き枠がなくなった → 他の項目の選択に戻す（固まって見えないように）
+            state.data.unavailable = (state.data.unavailable || []).concat('slot');
+            this._askMore(state, userId, replyToken, ss, st,
+              `申し訳ありません。選んでいる間に空きがなくなりました。現在、変更できる空きの${st.slot.label}がありません。\n`);
+            return;
+          }
+          LineApi.reply(replyToken, '申し訳ありません。その枠は満席になりました。空いている枠から選んでください。',
+            avail.map(s => SheetUtils.slotLabel(s)));
           return;
         }
         state.data.updates.slot = slot['枠番号'];
         // 希望する対応者が、新しい枠に対応していなければ、選び直してもらう
-        if (Settings.isOn(st, 'staff') && current.staff !== '' && current.staff !== undefined) {
+        const curStaff = state.data.updates.staff !== undefined ? state.data.updates.staff : current.staff;
+        if (Settings.isOn(st, 'staff') && curStaff !== '' && curStaff !== undefined) {
           const eligible = SheetUtils.getStaffForSlot(ss, slot['枠番号']);
-          if (eligible.indexOf(current.staff) === -1 && st.staff.choices.indexOf(current.staff) === -1) {
+          if (eligible.indexOf(curStaff) === -1 && st.staff.choices.indexOf(curStaff) === -1) {
             const options = [...eligible, ...st.staff.choices];
             if (options.length > 0) {
               state.step = 'INPUT_STAFF_AFTER_SLOT';
               StateManager.set(userId, state);
               LineApi.reply(replyToken,
-                `「${current.staff}」さんは${SheetUtils.slotLabel(slot)}に対応できません。\n新しい「${st.staff.label}」を選んでください。`,
+                `「${curStaff}」さんは${SheetUtils.slotLabel(slot)}に対応できません。\n新しい「${st.staff.label}」を選んでください。`,
                 options);
               return;
             }
@@ -144,7 +153,7 @@ const ChangeFlow = {
       case 'INPUT_NEW_VALUE': {
         const key = state.data.target;
         if (key === 'staff') {
-          const options = [...this._staffOptions(ss, st, state.data.rowIndex)];
+          const options = [...this._staffOptions(ss, st, state.data.rowIndex, state.data.updates.slot)];
           if (!options.includes(text)) {
             LineApi.reply(replyToken, '選択肢の中から選んでください。', options);
             return;
@@ -213,6 +222,14 @@ const ChangeFlow = {
     return SheetUtils.getReservations(ss).find(r => r.rowIndex === state.data.rowIndex);
   },
 
+  // 満席の枠は変更先に選べないことの注意書き（満席の枠がなければ空）
+  _fullSlotNote(ss, current) {
+    const full = SheetUtils.getSlotAvailability(ss).filter(a => a.remaining <= 0 &&
+      !(current && current.slot !== '' && Number(a.slot['枠番号']) === Number(current.slot)));
+    return full.length > 0
+      ? '\n※満席の枠は変更先に選べません。満席の枠をご希望の場合は、いったんキャンセルして「登録」からお申し込みください。' : '';
+  },
+
   // 変更先に選べる時間枠：空きがある枠（いまの枠は除く）
   _availableSlots(ss, current) {
     return SheetUtils.getAvailableSlots(ss)
@@ -220,9 +237,11 @@ const ChangeFlow = {
   },
 
   // 変更対象の予約の枠で対応できる人（枠が無い予約は全員）＋「誰でも良い」など
-  _staffOptions(ss, st, rowIndex) {
+  // この変更の中で枠をすでに変えているときは、変更後の枠で対応できる人を出す
+  _staffOptions(ss, st, rowIndex, newSlot) {
     const r = SheetUtils.getReservations(ss).find(x => x.rowIndex === rowIndex);
-    return [...SheetUtils.getStaffForSlot(ss, r ? r.slot : ''), ...st.staff.choices];
+    const slot = (newSlot !== undefined && newSlot !== '') ? newSlot : (r ? r.slot : '');
+    return [...SheetUtils.getStaffForSlot(ss, slot), ...st.staff.choices];
   },
 
   // 設定でONになっていて、変更の対象にできる項目
@@ -244,12 +263,12 @@ const ChangeFlow = {
       }
       state.step = 'INPUT_NEW_SLOT';
       StateManager.set(userId, state);
-      LineApi.reply(replyToken, `新しい「${label}」を選んでください。`, options.map(s => SheetUtils.slotLabel(s)));
+      LineApi.reply(replyToken, `新しい「${label}」を選んでください。` + this._fullSlotNote(ss, this._current(ss, state)), options.map(s => SheetUtils.slotLabel(s)));
     } else if (key === 'staff') {
       state.step = 'INPUT_NEW_VALUE';
       StateManager.set(userId, state);
       LineApi.reply(replyToken, `新しい「${label}」を選んでください。`,
-        this._staffOptions(ss, st, state.data.rowIndex));
+        this._staffOptions(ss, st, state.data.rowIndex, state.data.updates.slot));
     } else if (key === 'menu') {
       const menu = SheetUtils.getMenuList(ss);
       state.data.treatments = [];
