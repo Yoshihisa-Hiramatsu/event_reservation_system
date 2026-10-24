@@ -69,7 +69,9 @@ const SheetUtils = {
   },
 
   slotLabel(slot) {
-    return `${slot['枠名']}(${slot['開始時刻']})`;
+    // 開始時刻が空欄なら括弧を付けない（担当者ごとの枠など、時刻を出したくない使い方向け）
+    const time = String(slot['開始時刻'] === undefined || slot['開始時刻'] === null ? '' : slot['開始時刻']).trim();
+    return time === '' ? String(slot['枠名']) : `${slot['枠名']}(${time})`;
   },
 
   // 対応者一覧：A列（1列目）の2行目以降。見出しの文字は自由に変えてよい
@@ -269,7 +271,7 @@ const SheetUtils = {
     // 枠表示（O列）・重複チェック（P列）は数式で自動計算されるようにする
     // 「$B列が空欄でない」条件を加えて、空欄行同士が誤って重複判定されないようにしている
     sheet.getRange(targetRow, RES_COL.slotLabel).setFormula(
-      `=IFERROR(VLOOKUP($B${targetRow},枠マスタ!$A:$E,2,FALSE)&"("&TEXT(VLOOKUP($B${targetRow},枠マスタ!$A:$E,3,FALSE),"HH:mm")&")","")`
+      `=IFERROR(VLOOKUP($B${targetRow},枠マスタ!$A:$E,2,FALSE)&IF(VLOOKUP($B${targetRow},枠マスタ!$A:$E,3,FALSE)&""="","","("&TEXT(VLOOKUP($B${targetRow},枠マスタ!$A:$E,3,FALSE),"HH:mm")&")"),"")`
     );
     sheet.getRange(targetRow, RES_COL.dup).setFormula(
       `=IF(AND($B${targetRow}<>"",COUNTIFS($B$2:$B,$B${targetRow},$G$2:$G,$G${targetRow},$K$2:$K,"<>キャンセル")>1),"⚠重複あり","")`
