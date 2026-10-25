@@ -75,7 +75,7 @@ function menu_createEvent() {
 // ---------- 当日スケジュールと要確認リストを更新 ----------
 function menu_buildDaySchedule() {
   const ui = SpreadsheetApp.getUi();
-  const event = EventAdmin.pickEvent_('更新する開催を選んでください');
+  const event = EventAdmin.pickEvent_('更新する開催を選んでください', ['募集中', '締切']);
   if (!event) return;
 
   const ss = SheetUtils.openReservationSpreadsheet(event.spreadsheetUrl);
@@ -116,7 +116,7 @@ function menu_buildDaySchedule() {
 // ---------- 予約タブの見出しを設定に合わせる ----------
 function menu_applyHeaders() {
   const ui = SpreadsheetApp.getUi();
-  const event = EventAdmin.pickEvent_('見出しを更新する開催を選んでください');
+  const event = EventAdmin.pickEvent_('見出しを更新する開催を選んでください', null, ['終了']);
   if (!event) return;
 
   const ss = SheetUtils.openReservationSpreadsheet(event.spreadsheetUrl);
@@ -128,7 +128,7 @@ function menu_applyHeaders() {
 // LINEのBotが「どのファイルの設定タブを、どう読んでいるか」を表示する
 function menu_checkSettings() {
   const ui = SpreadsheetApp.getUi();
-  const event = EventAdmin.pickEvent_('設定を確認する開催を選んでください');
+  const event = EventAdmin.pickEvent_('設定を確認する開催を選んでください', null, ['終了']);
   if (!event) return;
   const ss = SheetUtils.openReservationSpreadsheet(event.spreadsheetUrl);
   ui.alert('設定の読み込み結果', Settings.describe(ss, event.name), ui.ButtonSet.OK);

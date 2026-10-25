@@ -61,11 +61,18 @@ const EventAdmin = {
   },
 
   // 開催マスタの一覧から、番号入力で1件選ぶ（メニュー用）。キャンセル・該当なしは null
-  pickEvent_(title) {
+  // statuses を渡すと、そのステータスの開催だけを候補にする（例：['募集中', '締切']）。
+  // excludeStatuses を渡すと、そのステータスの開催を除く（例：['終了']）
+  pickEvent_(title, statuses, excludeStatuses) {
     const ui = SpreadsheetApp.getUi();
-    const events = SheetUtils.getAllEvents();
+    let events = SheetUtils.getAllEvents();
+    const all = events.length;
+    if (statuses) events = events.filter(e => statuses.indexOf(e.status) !== -1);
+    if (excludeStatuses) events = events.filter(e => excludeStatuses.indexOf(e.status) === -1);
     if (events.length === 0) {
-      ui.alert('予約シートのURLが入っている開催が、開催マスタにありません。');
+      ui.alert(all === 0
+        ? '予約シートのURLが入っている開催が、開催マスタにありません。'
+        : (statuses ? `ステータスが「${statuses.join('」「')}」の開催が、開催マスタにありません。` : '対象の開催が、開催マスタにありません。'));
       return null;
     }
     if (events.length === 1) return events[0];
