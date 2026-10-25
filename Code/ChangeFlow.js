@@ -5,6 +5,7 @@
 // 変更できる項目（設定でONのものだけ）。年齢・性別は入力ミスの訂正用
 const CHANGEABLE_KEYS = ['slot', 'staff', 'menu', 'age', 'gender', 'note'];
 const CHANGE_QUIT = 'やめる';
+const CHANGE_QUIT_STEPS = ['INPUT_NEW_SLOT', 'INPUT_STAFF_AFTER_SLOT', 'INPUT_NEW_VALUE', 'INPUT_NEW_VALUE_MENU'];
 
 const ChangeFlow = {
   DONE: 'ない（確認へ進む）',
@@ -31,6 +32,13 @@ const ChangeFlow = {
       if (Identity.handleOrganizerStep(state, userId, replyToken, text)) {
         Identity.showList(state, userId, replyToken, ss, '変更');
       }
+      return;
+    }
+
+    // 新しい内容を聞いている途中でも「やめる」で変更を中止できる（それまでの変更は破棄）
+    if (text === CHANGE_QUIT && CHANGE_QUIT_STEPS.indexOf(state.step) !== -1) {
+      StateManager.clear(userId);
+      LineApi.reply(replyToken, '変更を中止しました。');
       return;
     }
 
@@ -114,7 +122,7 @@ const ChangeFlow = {
             return;
           }
           LineApi.reply(replyToken, '申し訳ありません。その枠は満席になりました。空いている枠から選んでください。',
-            avail.map(s => SheetUtils.slotLabel(s)));
+            RegisterFlow._withQuit(avail.map(s => SheetUtils.slotLabel(s))));
           return;
         }
         state.data.updates.slot = slot['枠番号'];
@@ -129,7 +137,7 @@ const ChangeFlow = {
               StateManager.set(userId, state);
               LineApi.reply(replyToken,
                 `「${curStaff}」さんは${SheetUtils.slotLabel(slot)}に対応できません。\n新しい「${st.staff.label}」を選んでください。`,
-                options);
+                RegisterFlow._withQuit(options));
               return;
             }
             state.data.updates.staff = '';
@@ -142,7 +150,7 @@ const ChangeFlow = {
       case 'INPUT_STAFF_AFTER_SLOT': {
         const options = [...SheetUtils.getStaffForSlot(ss, state.data.updates.slot), ...st.staff.choices];
         if (!options.includes(text)) {
-          LineApi.reply(replyToken, '選択肢の中から選んでください。', options);
+          LineApi.reply(replyToken, '選択肢の中から選んでください。', RegisterFlow._withQuit(options));
           return;
         }
         state.data.updates.staff = text;
@@ -155,12 +163,12 @@ const ChangeFlow = {
         if (key === 'staff') {
           const options = [...this._staffOptions(ss, st, state.data.rowIndex, state.data.updates.slot)];
           if (!options.includes(text)) {
-            LineApi.reply(replyToken, '選択肢の中から選んでください。', options);
+            LineApi.reply(replyToken, '選択肢の中から選んでください。', RegisterFlow._withQuit(options));
             return;
           }
         }
         if ((key === 'age' || key === 'gender') && !RegisterFlow._validChoice(st, key, text)) {
-          LineApi.reply(replyToken, '選択肢の中から選んでください。', st[key].choices);
+          LineApi.reply(replyToken, '選択肢の中から選んでください。', RegisterFlow._withQuit(st[key].choices));
           return;
         }
         const none = st.note.choices[0] || '特になし';
@@ -263,12 +271,12 @@ const ChangeFlow = {
       }
       state.step = 'INPUT_NEW_SLOT';
       StateManager.set(userId, state);
-      LineApi.reply(replyToken, `新しい「${label}」を選んでください。` + this._fullSlotNote(ss, this._current(ss, state)), options.map(s => SheetUtils.slotLabel(s)));
+      LineApi.reply(replyToken, `新しい「${label}」を選んでください。` + this._fullSlotNote(ss, this._current(ss, state)), RegisterFlow._withQuit(options.map(s => SheetUtils.slotLabel(s))));
     } else if (key === 'staff') {
       state.step = 'INPUT_NEW_VALUE';
       StateManager.set(userId, state);
       LineApi.reply(replyToken, `新しい「${label}」を選んでください。`,
-        this._staffOptions(ss, st, state.data.rowIndex, state.data.updates.slot));
+        RegisterFlow._withQuit(this._staffOptions(ss, st, state.data.rowIndex, state.data.updates.slot)));
     } else if (key === 'menu') {
       const menu = SheetUtils.getMenuList(ss);
       state.data.treatments = [];
@@ -281,7 +289,7 @@ const ChangeFlow = {
       // age / gender / note：選択肢があれば出し、自由入力も受け付ける
       state.step = 'INPUT_NEW_VALUE';
       StateManager.set(userId, state);
-      LineApi.reply(replyToken, `新しい「${label}」を入力してください。`, st[key].choices);
+      LineApi.reply(replyToken, `新しい「${label}」を入力してください。`, RegisterFlow._withQuit(st[key].choices));
     }
   },
 
