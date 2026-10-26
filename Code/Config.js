@@ -30,6 +30,9 @@ const RES_COL = {
 };
 const RES_DATA_COLS = 14; // 値を読み書きする列数（O・P列は数式）
 
+// 自動確定で、確定担当者が決められなかった予約に入れる文字
+const UNDECIDED = '未決定';
+
 const STATUS = { ACCEPTED: '受付', PENDING: '要確認', CANCELED: 'キャンセル', CHANGED: '変更済' };
 
 // 設定タブが無い・空欄のときに使う初期値（美容イベント版）

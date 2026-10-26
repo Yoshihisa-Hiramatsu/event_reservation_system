@@ -300,6 +300,82 @@ const SheetUtils = {
     ss.getSheetByName(SHEET_NAMES.RESERVATIONS).getRange(rowIndex, col).setValue(value);
   },
 
+  // 「未決定」にした理由の表示用の文
+  undecidedReason(reason) {
+    return reason === 'any' ? '希望なし（誰でも良い）'
+      : reason === 'ineligible' ? '希望の担当者が、この枠に対応できない'
+      : '同じ枠で重複（先に別の予約に割り当て済み）';
+  },
+
+  // 確定担当者が実際に入っているか（空欄と「未決定」は入っていないとみなす）
+  _hasConfirmedStaff(r) {
+    const v = String(r.confirmedStaff === undefined || r.confirmedStaff === null ? '' : r.confirmedStaff).trim();
+    return v !== '' && v !== UNDECIDED;
+  },
+
+  // 空欄の「確定担当者」「確定枠番号」を、希望の内容から自動で埋める（当日スケジュールの更新の前に呼ぶ）。
+  //   対象：ステータスが「受付」「変更済」で、枠が決まっている予約（時間枠を使わない開催は何もしない）
+  //   ・確定枠番号：空欄なら、お客様が選んだ枠番号を入れる
+  //   ・確定担当者：空欄（または「未決定」）のとき、次の条件をすべて満たせば希望の担当者を入れる。
+  //       具体的な人を希望している／その枠に対応できる／同じ枠で他の予約にまだ割り当てられていない（予約IDの順）
+  //     満たさなければ「未決定」と入れる（当日スケジュールには出さない）
+  //   手で入れた値は書き換えない。戻り値：{ slots: 確定枠を埋めた件数, staff: 確定担当者を埋めた件数,
+  //     undecided: [{ guest, slotLabel, reason }] }  reason: 'any'（誰でも・希望なし）/ 'ineligible'（その枠に対応できない）/ 'taken'（同じ枠で割り当て済み）
+  autoConfirm(ss) {
+    const st = Settings.load(ss);
+    const out = { slots: 0, staff: 0, undecided: [] };
+    if (!Settings.isOn(st, 'slot')) return out;
+
+    const slots = this.getSlotList(ss);
+    const eligibleCache = {};
+    const eligibleFor = n => {
+      const k = String(n);
+      if (!eligibleCache[k]) eligibleCache[k] = this.getStaffForSlot(ss, n);
+      return eligibleCache[k];
+    };
+    const slotOf = r => (r.confirmedSlot !== '' && r.confirmedSlot !== undefined && r.confirmedSlot !== null) ? r.confirmedSlot : r.slot;
+    const reservations = this.getReservations(ss).filter(r => r.status !== STATUS.CANCELED)
+      .sort((a, b) => Number(a.id) - Number(b.id));
+
+    // すでに割り当てられている「枠|担当者」（手で入れたものも含む）
+    const taken = {};
+    reservations.filter(r => this._hasConfirmedStaff(r)).forEach(r => {
+      const n = slotOf(r);
+      if (n !== '' && n !== undefined && n !== null) taken[String(n) + '|' + String(r.confirmedStaff).trim()] = true;
+    });
+
+    reservations.forEach(r => {
+      if (r.status !== STATUS.ACCEPTED && r.status !== STATUS.CHANGED) return;
+      const hasSlotNumber = r.slot !== '' && r.slot !== undefined && r.slot !== null;
+      const confirmedSlotBlank = r.confirmedSlot === '' || r.confirmedSlot === undefined || r.confirmedSlot === null;
+      if (confirmedSlotBlank && hasSlotNumber) {
+        this.updateReservationField(ss, r.rowIndex, 'confirmedSlot', r.slot);
+        r.confirmedSlot = r.slot;
+        out.slots++;
+      }
+      const n = slotOf(r);
+      if (n === '' || n === undefined || n === null) return;
+      if (this._hasConfirmedStaff(r)) return; // 手で入れた（または割り当て済みの）担当者はそのまま
+
+      const slot = slots.find(x => Number(x['枠番号']) === Number(n));
+      const wish = String(r.staff === undefined || r.staff === null ? '' : r.staff).trim();
+      let reason = '';
+      if (wish === '' || st.staff.choices.indexOf(wish) !== -1) reason = 'any';
+      else if (eligibleFor(n).indexOf(wish) === -1) reason = 'ineligible';
+      else if (taken[String(n) + '|' + wish]) reason = 'taken';
+
+      if (reason === '') {
+        this.updateReservationField(ss, r.rowIndex, 'confirmedStaff', wish);
+        taken[String(n) + '|' + wish] = true;
+        out.staff++;
+      } else {
+        if (String(r.confirmedStaff).trim() !== UNDECIDED) this.updateReservationField(ss, r.rowIndex, 'confirmedStaff', UNDECIDED);
+        out.undecided.push({ id: r.id, guest: r.guest, slotLabel: slot ? this.slotLabel(slot) : '枠' + n, reason: reason, wish: wish });
+      }
+    });
+    return out;
+  },
+
   // ---------- 当日スケジュール・要確認リスト ----------
 
   // 「確定担当者」が入っているのに、当日スケジュールに表示されない予約を返す（時間枠を使わない開催は空）。
@@ -311,7 +387,7 @@ const SheetUtils = {
     const slots = this.getSlotList(ss);
     const result = [];
     this.getReservations(ss)
-      .filter(r => r.status !== STATUS.CANCELED && r.confirmedStaff)
+      .filter(r => r.status !== STATUS.CANCELED && this._hasConfirmedStaff(r))
       .forEach(r => {
         const staff = String(r.confirmedStaff).trim();
         const slotNumber = (r.confirmedSlot !== '' && r.confirmedSlot !== undefined) ? r.confirmedSlot : r.slot;
@@ -337,7 +413,7 @@ const SheetUtils = {
     const eligibleCache = {};
     const result = [];
     this.getReservations(ss)
-      .filter(r => r.status !== STATUS.CANCELED && r.confirmedStaff)
+      .filter(r => r.status !== STATUS.CANCELED && this._hasConfirmedStaff(r))
       .forEach(r => {
         const slotNumber = (r.confirmedSlot !== '' && r.confirmedSlot !== undefined) ? r.confirmedSlot : r.slot;
         if (slotNumber === '' || slotNumber === undefined || slotNumber === null) return;
@@ -357,7 +433,7 @@ const SheetUtils = {
   // 当日スケジュール（行=枠、列=対応者）を対応者一覧・枠マスタ・予約タブから作り直す。
   // 「確定担当者」が入っている予約だけを反映する。同じ枠・同じ対応者に2人以上いる
   // セルはオレンジ色で目立たせる。戻り値は重複セルの件数。
-  buildDaySchedule(ss) {
+  buildDaySchedule(ss, undecided) {
     const st = Settings.load(ss);
     let sheet = ss.getSheetByName(SHEET_NAMES.DAY_SCHEDULE);
     if (!sheet) sheet = ss.insertSheet(SHEET_NAMES.DAY_SCHEDULE);
@@ -394,14 +470,15 @@ const SheetUtils = {
 
     // 「確定担当者」が入っている予約（キャンセル除く）だけを集計する
     const reservations = this.getReservations(ss)
-      .filter(r => r.status !== STATUS.CANCELED && r.confirmedStaff);
+      .filter(r => r.status !== STATUS.CANCELED && this._hasConfirmedStaff(r));
 
     const cellMap = {}; // "枠番号|担当者名" -> ["ゲスト名\n（動員する人）\nメニュー", ...]
     reservations.forEach(r => {
       const slotNumber = (r.confirmedSlot !== '' && r.confirmedSlot !== undefined) ? r.confirmedSlot : r.slot;
       const key = slotNumber + '|' + String(r.confirmedStaff).trim();
       if (!cellMap[key]) cellMap[key] = [];
-      const lines = [r.guest];
+      // 予約タブのどの行（予約ID）を直せばよいかが分かるよう、ゲスト名の前に予約番号を付ける
+      const lines = [`【No.${r.id}】${r.guest}`];
       // 動員する人をOFFにしている開催では、動員する人＝ゲスト名なので表示しない
       if (Settings.isOn(st, 'organizer') && r.organizer) lines.push(`（${r.organizer}）`);
       if (r.menu) lines.push(r.menu);
@@ -434,6 +511,20 @@ const SheetUtils = {
     // 複数人が入っているセル（改行あり）があっても読めるよう、全体の行の高さを自動調整する
     if (slots.length > 0 && staffList.length > 0) {
       sheet.autoResizeRows(2, slots.length);
+    }
+
+    // 表の下に「未決定」の予約を一覧にする（自動確定で担当者を決められなかった予約）
+    if (undecided && undecided.length > 0) {
+      const top = slots.length + 3; // 表との間に1行あける
+      sheet.getRange(top, 1).setValue(`未決定の予約（${undecided.length}件）：予約タブの「確定${st.staff_role.label}」に手で入力すると、次の更新から表に載ります。`)
+        .setFontWeight('bold');
+      const head = ['予約番号', st.guest.label, st.slot.label, `希望した${st.staff_role.label}`, '理由'];
+      sheet.getRange(top + 1, 1, 1, head.length).setValues([head])
+        .setBackground('#0F6E56').setFontColor('#FFFFFF').setFontWeight('bold');
+      const rows = undecided.map(u => ['No.' + u.id, u.guest, u.slotLabel, u.wish || '（希望なし）', this.undecidedReason(u.reason)]);
+      sheet.getRange(top + 2, 1, rows.length, head.length).setValues(rows)
+        .setWrap(true).setVerticalAlignment('top').setBackground('#FDECC8');
+      sheet.autoResizeRows(top + 1, rows.length + 1);
     }
 
     return duplicateCount;

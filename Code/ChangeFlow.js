@@ -331,6 +331,10 @@ const ChangeFlow = {
     Object.keys(d.updates).forEach(key => SheetUtils.updateReservationField(ss, d.rowIndex, key, d.updates[key]));
     // 主催者が「確定枠番号」を入れていた場合は、古い枠を指したままにならないよう外す
     if (d.updates.slot !== undefined) SheetUtils.updateReservationField(ss, d.rowIndex, 'confirmedSlot', '');
+    // 枠か希望の担当者が変わったときは、確定していた担当者も外す（次の「更新」で、新しい希望から改めて割り当てられる）
+    const clearedStaff = (d.updates.slot !== undefined || d.updates.staff !== undefined) && before && SheetUtils._hasConfirmedStaff(before)
+      ? String(before.confirmedStaff).trim() : '';
+    if (d.updates.slot !== undefined || d.updates.staff !== undefined) SheetUtils.updateReservationField(ss, d.rowIndex, 'confirmedStaff', '');
 
     // 「要確認」の予約は、変更しても要確認のままにする（満枠の確認が消えないように）
     if (!before || before.status !== STATUS.PENDING) {
@@ -347,8 +351,8 @@ const ChangeFlow = {
       SheetUtils.getSlotList(ss).forEach(s => { slotMap[Number(s['枠番号'])] = SheetUtils.slotLabel(s); });
       const from = (before && before.slot !== '') ? (slotMap[Number(before.slot)] || '枠' + before.slot) : '（枠なし）';
       detail = `\n${st.slot.label}：${from} → ${slotMap[Number(d.updates.slot)]}`;
-      if (before && before.confirmedStaff) detail += `\n※${st.staff_role.label}を確定済みでした。確認してください。`;
     }
+    if (clearedStaff) detail += `\n※確定していた${st.staff_role.label}「${clearedStaff}」を外しました。「当日スケジュールと要確認リストを更新」で、新しい希望から改めて割り当てられます。`;
     if (overlap) detail += '\n⚠同じ枠で同じ希望対応者の予約が重なっています。';
     SheetUtils.notifyOrganizers(`【変更】[${state.eventName}] ${who}変更しました（${labels}）。${detail}`);
     StateManager.clear(userId);

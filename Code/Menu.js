@@ -79,7 +79,9 @@ function menu_buildDaySchedule() {
   if (!event) return;
 
   const ss = SheetUtils.openReservationSpreadsheet(event.spreadsheetUrl);
-  const duplicateCount = SheetUtils.buildDaySchedule(ss);
+  // 空欄の確定担当者・確定枠番号を、希望の内容から自動で埋めてから、スケジュールを作る
+  const auto = SheetUtils.autoConfirm(ss);
+  const duplicateCount = SheetUtils.buildDaySchedule(ss, auto.undecided);
   const pendingCount = SheetUtils.buildPendingList(ss);
 
   const lines = [`「${event.name}」を更新しました。`];
@@ -89,6 +91,20 @@ function menu_buildDaySchedule() {
     lines.push(duplicateCount > 0
       ? `同じ対応者に複数ゲストが割り当てられているセルが ${duplicateCount} 件あります（オレンジ色のセル）。`
       : '当日スケジュールに重複はありません。');
+  }
+  const role = Settings.load(ss).staff_role.label;
+  if (auto.slots > 0 || auto.staff > 0) {
+    lines.push(`自動で確定しました：確定枠番号 ${auto.slots} 件／確定${role} ${auto.staff} 件`);
+  }
+  if (auto.undecided.length > 0) {
+    lines.push('', `確定${role}が「未決定」の予約が ${auto.undecided.length} 件あります（当日スケジュールには出ていません）。`);
+    auto.undecided.forEach(u => {
+      const why = u.reason === 'any' ? '希望なし（誰でも良い）'
+        : u.reason === 'ineligible' ? `希望の「${u.wish}」はこの枠に対応できません`
+        : `希望の「${u.wish}」は、同じ枠で別の予約に割り当て済みです`;
+      lines.push(`・${u.guest}さん（${u.slotLabel}）：${why}`);
+    });
+    lines.push('', `予約タブの「確定${role}」に手で入力すると、次の更新から反映されます。`, '（この一覧は、当日スケジュールの表の下にも出ています）', '');
   }
   // 担当者が対応できない枠に入っている予約があれば、一覧で知らせる
   const unavailable = SheetUtils.getUnavailableAssignments(ss);
